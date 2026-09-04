@@ -18,7 +18,7 @@ jobs:
         run: |
           rm -rf extracted
           mkdir extracted
-          unzip -o "مهاجرت-هما-آی-نهایی.zip" -d extracted
+          unzip -o "homa-ai-migration-final.zip" -d extracted
 
           if [ -d "extracted/backend" ]; then
             cp -r extracted/backend/. ./
