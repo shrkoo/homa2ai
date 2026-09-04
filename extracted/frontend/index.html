@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="https://base44.com/logo_v2.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="description" content="Homa AI - دستیار هوشمند چندزبانه (فارسی، کردی، انگلیسی) برای چت، تولید محتوا و سازمان‌سازی." />
+    <link rel="canonical" href="https://homa-ai.base44.com/privacy" />
+    <meta property="og:title" content="Homa AI | هُما AI – دستیار هوشمند" />
+    <meta property="og:description" content="دستیار هوشمند چندزبانه برای چت، تولید محتوا و سازمان‌سازی." />
+    <meta property="og:type" content="website" />
+    <title>Homa AI | هُما AI – دستیار هوشمند</title>
+    <style>
+      /* Hide the "Edit with Base44" platform badge — aggressive selectors */
+      #base44-badge,
+      base44-badge,
+      [id*="base44-badge"],
+      [class*="base44-badge"],
+      [id*="base44_badge"],
+      [class*="base44_badge"],
+      a[href*="base44.com"][target="_blank"],
+      [data-base44-badge],
+      [data-base44] {
+        display: none !important;
+        visibility: hidden !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
+        width: 0 !important;
+        height: 0 !important;
+        overflow: hidden !important;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+    <script>
+      // Remove the "Edit with Base44" platform badge at runtime.
+      // The platform injects it after load; CSS can't always reach it
+      // (shadow DOM / dynamic selectors), so this observer removes it.
+      (function () {
+        var BADGE_TEXT = /edit\s*with\s*base44|build\s*with\s*base44/i;
+        function kill(node) {
+          if (!node || node.nodeType !== 1) return;
+          // Match by id/class/data attributes
+          var id = (node.id || "").toLowerCase();
+          var cls = (node.className && typeof node.className === "string") ? node.className.toLowerCase() : "";
+          var data = node.outerHTML ? node.outerHTML.toLowerCase() : "";
+          if (
+            id.indexOf("base44") !== -1 ||
+            cls.indexOf("base44") !== -1 ||
+            data.indexOf("data-base44") !== -1 ||
+            data.indexOf("base44-badge") !== -1 ||
+            (node.tagName === "A" && data.indexOf("base44.com") !== -1)
+          ) {
+            node.remove();
+            return;
+          }
+          // Match by visible text content (the badge label)
+          var text = node.textContent ? node.textContent.trim() : "";
+          if (text && BADGE_TEXT.test(text) && node.children.length <= 3) {
+            node.remove();
+            return;
+          }
+        }
+        function scan(root) {
+          try {
+            root.querySelectorAll("*").forEach(kill);
+          } catch (e) {}
+        }
+        if (typeof MutationObserver !== "undefined") {
+          var obs = new MutationObserver(function (mutations) {
+            mutations.forEach(function (m) {
+              m.addedNodes.forEach(function (n) {
+                kill(n);
+                if (n && n.nodeType === 1 && n.querySelectorAll) scan(n);
+              });
+            });
+          });
+          document.addEventListener("DOMContentLoaded", function () {
+            scan(document.body);
+            obs.observe(document.body, { childList: true, subtree: true });
+          });
+        }
+      })();
+    </script>
+  </body>
+</html>
