@@ -1,0 +1,36 @@
+name: Extract Homa Backend
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract migration ZIP
+        run: |
+          rm -rf extracted
+          mkdir extracted
+          unzip -o "مهاجرت-هما-آی-نهایی.zip" -d extracted
+
+          if [ -d "extracted/backend" ]; then
+            cp -r extracted/backend/. ./
+          else
+            echo "backend folder not found"
+            exit 1
+          fi
+
+      - name: Commit restored structure
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Restore Homa backend folder structure" || echo "No changes"
+          git push
