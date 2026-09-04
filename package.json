@@ -1,0 +1,16 @@
+{
+  "name": "homa-ai-core",
+  "version": "1.0.0",
+  "description": "Homa AI — Independent Cloudflare Worker backend (D1 + KV + R2). No Base44 runtime dependency.",
+  "main": "homa-ai-worker.js",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "tail": "wrangler tail",
+    "db:init": "wrangler d1 execute homa-ai-db --file=./schema.sql",
+    "db:query": "wrangler d1 execute homa-ai-db --command"
+  },
+  "devDependencies": {
+    "wrangler": "^3.80.0"
+  }
+}
