@@ -3,59 +3,23 @@ main = "homa-ai-worker.js"
 compatibility_date = "2024-09-01"
 
 # ===== KV Namespaces =====
-# Use EXISTING KV namespace IDs from your Cloudflare dashboard.
-# Find them with:  wrangler kv namespace list
-# Or in the Cloudflare dashboard → Workers & Pages → KV
 
 [[kv_namespaces]]
 binding = "GOOGLE_TOKENS"
-id = "YOUR_GOOGLE_TOKENS_KV_ID"
+id = "cf4d81add5a44f42a32cff34c46e2f90"
 
 [[kv_namespaces]]
 binding = "USER_CONNECTIONS"
-id = "YOUR_USER_CONNECTIONS_KV_ID"
-
-[[kv_namespaces]]
-binding = "USER_DATA"
-id = "YOUR_USER_DATA_KV_ID"
+id = "f5ccb2cffddf4e14ac9fd2346d81ba7e"
 
 # ===== D1 Database =====
-# Use the EXISTING "homa-ai-db" D1 database.
-# Find the ID with:  wrangler d1 list
-# Or in the Cloudflare dashboard → Workers & Pages → D1
 
 [[d1_databases]]
 binding = "DB"
 database_name = "homa-ai-db"
 database_id = "YOUR_D1_DATABASE_ID"
 
-# ===== R2 Bucket (optional) =====
-# For file storage. Falls back to 0x0.st proxy if not configured.
-# Find with:  wrangler r2 bucket list
-
-[[r2_buckets]]
-binding = "STORAGE"
-bucket_name = "homa-storage"
-
 # ===== Smart Watch Cron Trigger =====
-# Runs every 30 minutes — checks all active smart/price_alert reminders.
-# Evaluates price conditions and triggers notifications when met.
+
 [triggers]
 crons = ["*/30 * * * *"]
-
-# ===== Secrets (set via CLI, NOT in this file) =====
-# Required:
-#   wrangler secret put HOMA_WORKER_KEY         (auth token signing — REQUIRED)
-#   wrangler secret put HOMA_ENCRYPTION_KEY      (AES-GCM for credentials/tokens)
-#   wrangler secret put GROQ_API_KEY             (chat, search, STT, file analysis)
-#   wrangler secret put OPENROUTER_API_KEY       (chat, vision, deep research)
-#
-# Optional:
-#   wrangler secret put RESEND_API_KEY           (email — OTP & password reset emails)
-#   wrangler secret put GOOGLE_CLIENT_ID         (Google OAuth — Tasks/Calendar)
-#   wrangler secret put GOOGLE_CLIENT_SECRET      (Google OAuth — Tasks/Calendar)
-#   wrangler secret put ZARINPAL_MERCHANT_ID      (payments)
-#   wrangler secret put ZARINPAL_API_KEY         (payments)
-#   wrangler secret put PIPER_TTS_URL            (TTS — alternative TTS engine)
-#   wrangler secret put PIPER_TTS_API_KEY        (TTS)
-#   wrangler secret put REPLICATE_API_TOKEN      (image/video editing)
