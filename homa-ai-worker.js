@@ -1855,6 +1855,9 @@ export default {
     try { userKey = await deriveUserKey(userToken, env); }
     catch { return jsonBody({ error: 'user_identity_required', code: 'no_user_token' }, 401); }
 
+    const isDataRoute = url.pathname.startsWith('/data/');
+    const isAlarmRoute = /^\/(alarms|reminders)/.test(url.pathname);
+
     try {
       // D1 data CRUD (POST/PATCH/DELETE)
       if (isDataRoute) {
