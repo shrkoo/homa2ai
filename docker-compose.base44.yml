@@ -1,0 +1,53 @@
+name: app
+
+services:
+  api:
+    image: node:20-bookworm-slim
+    working_dir: /workspace
+    command: ["sh", "-ec", "npm install --no-audit --no-fund && npx wrangler d1 execute homa-ai-db --local --file=./schema.sql 2>/dev/null; exec npx wrangler dev --port 8788 --ip 0.0.0.0"]
+    restart: on-failure
+    env_file:
+      - /run/base44/app.env
+    environment:
+      - BASE44_PREVIEW_MODE=1
+    volumes:
+      - ./:/workspace
+      - api_node_modules:/workspace/node_modules
+      - api_wrangler:/workspace/.wrangler
+    ports:
+      - "8788:8788"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8788/auth/me').then(r=>process.exit(r.status===401?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+
+  web:
+    image: node:20-bookworm-slim
+    working_dir: /workspace/extracted/frontend
+    command: ["sh", "-ec", "npm install --no-audit --no-fund && exec npx vite dev --host 0.0.0.0 --port 5173 --config vite.preview.config.js"]
+    restart: on-failure
+    environment:
+      - BASE44_PREVIEW_MODE=1
+      - __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=${BASE44_PUBLIC_HOST_SUFFIX}
+      - VITE_WORKER_URL=https://8788-${BASE44_PUBLIC_HOST_SUFFIX}
+    volumes:
+      - ./:/workspace
+      - web_node_modules:/workspace/extracted/frontend/node_modules
+    ports:
+      - "3000:5173"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5173/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+volumes:
+  api_node_modules:
+  api_wrangler:
+  web_node_modules:
