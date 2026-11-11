@@ -1,0 +1,18 @@
+{
+  "name": "Homa AI | هُما AI – دستیار هوشمند",
+  "short_name": "Homa AI",
+  "description": "دستیار هوشمند چندزبانه برای چت، تولید محتوا و سازمان‌سازی.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f141f",
+  "theme_color": "#0f141f",
+  "dir": "rtl",
+  "lang": "fa",
+  "icons": [
+    {
+      "src": "https://base44.com/logo_v2.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}
