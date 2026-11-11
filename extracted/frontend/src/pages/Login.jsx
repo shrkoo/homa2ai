@@ -35,7 +35,7 @@ export default function Login() {
   };
 
   const handleGoogle = () => { try { loginWithAccountPicker("google"); } catch (e) { setError(e.message); } };
-  const handleApple = () => { try { authAdapter.loginWithProvider("apple", returnTo); } catch (e) { setError(e.message); } };
+  const handleApple = async () => { try { await authAdapter.loginWithProvider("apple", returnTo); } catch (e) { setError(e.message); } };
   const handleMicrosoft = () => { try { loginWithAccountPicker("microsoft"); } catch (e) { setError(e.message); } };
   const handleFacebook = () => { try { loginWithAccountPicker("facebook"); } catch (e) { setError(e.message); } };
 
