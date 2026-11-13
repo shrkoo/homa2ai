@@ -30,6 +30,12 @@ The existing deployment is documented as using the Workers `homa-ai-core` and `h
 
 The frontend still contains Base44 SDK integration points. A repository audit dated 2026-09-03 records direct Base44 entity/function/auth usage. Treat those counts as historical audit notes, not as a fresh verified count. Do not attempt a Base44-removal migration for this import.
 
+## Deployment safety note from repository inspection
+
+Both the repository-root `wrangler.toml` and `extracted/backend/wrangler.toml` currently contain placeholder resource IDs such as `YOUR_D1_DATABASE_ID` and `YOUR_*_KV_ID`. The repository also has a manually triggered Worker deployment workflow. Do not run that workflow, run `wrangler deploy`, or execute database initialization as part of the Base44 frontend import. The deployed Cloudflare resources and their live bindings remain authoritative; these repository templates must not be used to recreate or overwrite them.
+
+The frontend has its own `package.json` and Vite config under `extracted/frontend`. The backend has a separate `package.json` under `extracted/backend`. Keep the frontend and backend install/build/deploy processes separate.
+
 ## Safe import checklist
 
 - [ ] Confirm Base44 BYOP access is enabled for the destination account.
