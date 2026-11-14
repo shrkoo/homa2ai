@@ -33,6 +33,7 @@ import { successResponse, errorResponse, ErrorCodes } from '../lib/errors.js';
 // ===== Email helpers (Resend API — optional) =====
 async function sendOtpEmail(env, email, otpCode) {
   if (!env.RESEND_API_KEY) return false;
+  const from = env.MAIL_FROM || 'Homa AI <noreply@resend.dev>';
   try {
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
@@ -41,7 +42,7 @@ async function sendOtpEmail(env, email, otpCode) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        from: 'Homa AI <noreply@resend.dev>',
+        from,
         to: email,
         subject: 'کد تأیید هُما',
         html: `<div style="font-family:Vazirmatn,sans-serif;direction:rtl;text-align:center;padding:32px"><h2>هُما</h2><p style="font-size:18px">کد تأیید شما:</p><p style="font-size:36px;font-weight:bold;letter-spacing:8px;color:#217 91% 60%">${otpCode}</p><p style="color:#666">این کد تا ۱۰ دقیقه معتبر است.</p></div>`,
@@ -55,6 +56,7 @@ async function sendOtpEmail(env, email, otpCode) {
 
 async function sendResetEmail(env, email, resetToken) {
   if (!env.RESEND_API_KEY) return false;
+  const from = env.MAIL_FROM || 'Homa AI <noreply@resend.dev>';
   try {
     const resetUrl = `${env.APP_BASE_URL || 'https://capable-aria-chat-flow.base44.app'}/reset-password?token=${resetToken}`;
     const res = await fetch('https://api.resend.com/emails', {
