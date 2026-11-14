@@ -73,9 +73,136 @@ const ANALYZE_TYPES = {
   analyzeFacebook: 'facebook',
 };
 
+// Routes that the current Cloudflare Worker exposes with Homa-user-token auth.
+// These routes deliberately do not send the shared HOMA_WORKER_KEY to browsers.
+async function invokeUserRoute(url, userToken, path, method = 'GET', payload) {
+  if (!userToken) {
+    const err = new Error('User authentication required');
+    err.status = 401;
+    err.code = 'no_user_token';
+    throw err;
+  }
+  const response = await fetch(url + path, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      'X-User-Token': userToken,
+    },
+    body: payload === undefined ? undefined : JSON.stringify(payload),
+  });
+  let data;
+  try { data = await response.json(); } catch { throw new Error('Worker returned an invalid response'); }
+  if (!response.ok || data?.success === false) {
+    const message = data?.error?.message || data?.error || `worker_${response.status}`;
+    const err = new Error(typeof message === 'string' ? message : JSON.stringify(message));
+    err.status = response.status;
+    err.code = data?.error?.code;
+    throw err;
+  }
+  return data;
+}
+
+async function invokePrivilegedRoute(url, userToken, path, method = 'GET', payload) {
+  let workerKey = '';
+  try { workerKey = (localStorage.getItem('homa_worker_key') || '').trim(); } catch {}
+  if (!workerKey) {
+    const err = new Error('برای این بخش، کلید مدیریتی Worker در تنظیمات این دستگاه ثبت نشده است.');
+    err.code = 'worker_key_missing';
+    throw err;
+  }
+  if (!userToken) throw new Error('User authentication required');
+  const response = await fetch(url + path, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${workerKey}`,
+      'X-User-Token': userToken,
+    },
+    body: payload === undefined ? undefined : JSON.stringify(payload),
+  });
+  let data;
+  try { data = await response.json(); } catch { throw new Error('Worker returned an invalid response'); }
+  if (!response.ok || data?.success === false) {
+    const message = data?.error?.message || data?.error || `worker_${response.status}`;
+    const err = new Error(typeof message === 'string' ? message : JSON.stringify(message));
+    err.status = response.status;
+    err.code = data?.error?.code;
+    throw err;
+  }
+  return data;
+}
+
+async function invokeMappedUserRoute(functionName, url, userToken, payload = {}) {
+  switch (functionName) {
+    case 'createTicket':
+      return invokeUserRoute(url, userToken, '/support/tickets', 'POST', payload);
+    case 'replyTicket': {
+      if (!payload.ticket_id) throw new Error('ticket_id_required');
+      return invokeUserRoute(url, userToken, `/support/tickets/${encodeURIComponent(payload.ticket_id)}/reply`, 'POST', { content: payload.content, author_name: payload.author_name });
+    }
+    case 'referralStatus':
+      return invokeUserRoute(url, userToken, '/referrals/status');
+    case 'processReferral':
+      return invokeUserRoute(url, userToken, '/referrals/process', 'POST', {
+        referred_user_id: payload.referred_user_id || payload.referee_id || payload.user_id,
+        referred_email: payload.referred_email || '',
+        referrer_code: payload.referrer_code || payload.referral_code || '',
+      });
+    case 'createZarinpalPayment':
+      return invokeUserRoute(url, userToken, '/payments/create', 'POST', payload);
+    case 'getPaymentStatus':
+      if (!payload.order_id) throw new Error('order_id_required');
+      return invokeUserRoute(url, userToken, `/payments/status/${encodeURIComponent(payload.order_id)}`);
+    default:
+      return null;
+  }
+}
+
 export async function invokeFunctionDirect(functionName, payload) {
   const url = getWorkerUrl();
   const userToken = getToken();
+
+  // Routes implemented by the current Worker API and authenticated with the user's Homa token.
+  const userRouteResult = await invokeMappedUserRoute(functionName, url, userToken, payload);
+  if (userRouteResult !== null) return userRouteResult;
+
+  // Admin and developer-platform routes require the Worker key plus the user's Homa token.
+  // The key is read only from this device's Settings storage; it is never hard-coded.
+  const privilegedRoutes = {
+    adminDashboard: { path: '/admin/dashboard', method: 'GET' },
+    adminReferrals: { path: '/admin/referrals', method: 'GET' },
+    adminOrders: { path: '/admin/orders', method: 'GET' },
+    adminUsers: { path: '/admin/users', method: 'GET' },
+    adminCreditTransactions: { path: '/admin/credits/transactions', method: 'GET' },
+    apiUsage: { path: '/api/usage?limit=200', method: 'GET' },
+    adminListTickets: { path: '/admin/tickets', method: 'GET' },
+    adminReplyTicket: { path: `/support/tickets/${encodeURIComponent(payload.ticket_id || '')}/admin-reply`, method: 'POST', body: { content: payload.content, author_name: payload.author_name, status: payload.status } },
+    adminUpdateTicket: { path: `/admin/tickets/${encodeURIComponent(payload.ticket_id || '')}`, method: 'PATCH', body: { status: payload.status, priority: payload.priority } },
+    adminManageUser: payload.action === 'add_credits' || payload.action === 'remove_credits'
+      ? { path: `/admin/users/${encodeURIComponent(payload.userId || payload.user_id || '')}/credits`, method: 'POST', body: { amount: Math.abs(Number(payload.value || 0)), action: payload.action === 'remove_credits' ? 'remove' : 'add' } }
+      : payload.action === 'set_plan'
+        ? { path: `/admin/users/${encodeURIComponent(payload.userId || payload.user_id || '')}/plan`, method: 'POST', body: { plan: payload.value } }
+        : { path: `/admin/users/${encodeURIComponent(payload.userId || payload.user_id || '')}`, method: 'PATCH', body: payload.updates || {} },
+    homaApiHealth: { path: '/admin/provider-health', method: 'GET' },
+    exportToDocs: null,
+    exportToSheets: null,
+  };
+  if (Object.prototype.hasOwnProperty.call(privilegedRoutes, functionName)) {
+    const route = privilegedRoutes[functionName];
+    if (!route) throw new Error('این عملیات هنوز در Worker فعلی پیاده‌سازی نشده است.');
+    if (functionName === 'adminManageUser' && !payload.userId && !payload.user_id) {
+      throw new Error('شناسه کاربر ارسال نشده است.');
+    }
+    if (functionName === 'adminManageUser' && route.method === 'PATCH' && !Object.keys(route.body).length) {
+      throw new Error('فیلدهای تغییر کاربر معتبر نیستند.');
+    }
+    const result = await invokePrivilegedRoute(url, userToken, route.path, route.method, route.body);
+    if (functionName === 'adminListTickets' && payload.status && payload.status !== 'all') {
+      const data = result?.data || result;
+      if (Array.isArray(data?.tickets)) data.tickets = data.tickets.filter((ticket) => ticket.status === payload.status);
+    }
+    return result;
+  }
 
   // Connector routes — path-based, require user identity
   const connectorRoute = CONNECTOR_PATH_ROUTES[functionName];

@@ -81,9 +81,9 @@ export function useChat(id, navigate) {
     dataAdapter.filter('Usage', {}, '-created_date', 1).then((res) => { if (res[0]) setUsage(res[0]); }).catch(() => {});
     try {
       const ref = localStorage.getItem('homa_ref');
-      if (ref) referralAdapter.processReferralByRef(ref).then(() => localStorage.removeItem('homa_ref')).catch(() => {});
+      if (ref && user?.id) referralAdapter.processReferralByRef(ref, user.id, user.email).then(() => localStorage.removeItem('homa_ref')).catch(() => {});
     } catch {}
-  }, []);
+  }, [user?.id, user?.email]);
 
   useEffect(() => {
     if (!id || id === 'new') {

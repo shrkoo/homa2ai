@@ -26,6 +26,8 @@ const getToken = () => {
 async function apiFetch(path, options = {}) {
   const url = getWorkerUrl();
   const token = getToken();
+  let workerKey = '';
+  try { workerKey = (localStorage.getItem('homa_worker_key') || '').trim(); } catch {}
   if (!url) throw new Error('Worker not configured');
   if (!token) throw new Error('Not authenticated');
 
@@ -34,6 +36,7 @@ async function apiFetch(path, options = {}) {
     headers: {
       'Content-Type': 'application/json',
       'X-User-Token': token,
+      ...(workerKey ? { Authorization: 'Bearer ' + workerKey } : {}),
     },
     body: options.body ? JSON.stringify(options.body) : undefined,
   });

@@ -67,12 +67,12 @@ export default function AdminTickets() {
     if (!reply.trim() || !selected || busy) return;
     setBusy(true);
     try {
-      const res = await supportAdapter.replyTicket({ ticket_id: selected.id, content: reply.trim() });
+      const res = await supportAdapter.adminReplyTicket({ ticket_id: selected.id, content: reply.trim(), author_name: user?.full_name || 'پشتیبانی هُما AI' });
       const data = res?.data || res;
       if (!data.error) {
         setReply('');
-        const tk = tickets.find((x) => x.id === selected.id);
-        const updated = { ...tk, status: 'in_progress', replies: [...(tk.replies || []), data.reply] };
+        const tk = tickets.find((x) => x.id === selected.id) || selected;
+        const updated = { ...tk, status: 'in_progress', replies: [...(tk.replies || []), { content: reply.trim(), by_admin: true, author_name: user?.full_name || 'پشتیبانی هُما AI', created_at: new Date().toISOString() }] };
         setSelected(updated);
         setTickets((prev) => prev.map((x) => (x.id === selected.id ? updated : x)));
         toast({ title: t('reply_sent') });
