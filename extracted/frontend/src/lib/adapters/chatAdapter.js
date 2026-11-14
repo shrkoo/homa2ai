@@ -62,8 +62,11 @@ export const chatAdapter = {
   },
 
   async searchConversations(query) {
-    // Worker supports query filters; Base44 filter does too
-    return entities.Conversation.filter({ title: { $regex: query } }, '-updated_date', 50);
+    const needle = String(query || '').trim().toLocaleLowerCase();
+    if (!needle) return [];
+    // The D1 Worker filter supports equality/range operators, not Mongo-style $regex.
+    const rows = await entities.Conversation.list('-updated_date', 200);
+    return rows.filter((item) => String(item.title || '').toLocaleLowerCase().includes(needle)).slice(0, 50);
   },
 
   // ── Messages ────────────────────────────────────────────────

@@ -63,16 +63,22 @@ export const isWorkerReady = () => {
 };
 
 // ===== Generic Worker D1 REST call =====
-async function workerCall(path, method, body) {
+async function workerCall(path, method, body, privileged = false) {
   const { url, token } = getWorkerConfig();
   if (!url) throw new Error('worker_not_configured');
   if (!token) throw new Error('not_authenticated');
+  let workerKey = '';
+  if (privileged) {
+    try { workerKey = (localStorage.getItem('homa_worker_key') || '').trim(); } catch {}
+    if (!workerKey) throw new Error('worker_key_missing');
+  }
 
   const res = await fetch(url + path, {
     method,
     headers: {
       'Content-Type': 'application/json',
       'X-User-Token': token,
+      ...(workerKey ? { Authorization: 'Bearer ' + workerKey } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -89,7 +95,9 @@ async function workerCall(path, method, body) {
 function parseSort(sort) {
   if (!sort) return { field: 'created_at', dir: 'DESC' };
   const dir = sort.startsWith('-') ? 'DESC' : 'ASC';
-  const field = sort.replace(/^-/, '');
+  const requestedField = sort.replace(/^-/, '');
+  // The previous Base44 entity API used *_date; the D1 schema uses *_at.
+  const field = ({ created_date: 'created_at', updated_date: 'updated_at' })[requestedField] || requestedField;
   return { field, dir };
 }
 
@@ -97,6 +105,7 @@ function parseSort(sort) {
 function makeWorkerEntity(pascalName) {
   const entityName = toWorkerEntityName(pascalName);
   const base = `/data/${entityName}`;
+  const privileged = ['Plan', 'FeatureCost', 'ProviderConfig'].includes(pascalName);
 
   return {
     async list(sort, limit) {
@@ -127,31 +136,31 @@ function makeWorkerEntity(pascalName) {
     },
 
     async create(data) {
-      return await workerCall(base, 'POST', data);
+      return await workerCall(base, 'POST', data, privileged);
     },
 
     async bulkCreate(records) {
-      return await workerCall(`${base}/bulk`, 'POST', { records });
+      return await workerCall(`${base}/bulk`, 'POST', { records }, privileged);
     },
 
     async update(id, data) {
-      return await workerCall(`${base}/${encodeURIComponent(id)}`, 'PATCH', data);
+      return await workerCall(`${base}/${encodeURIComponent(id)}`, 'PATCH', data, privileged);
     },
 
     async delete(id) {
-      return await workerCall(`${base}/${encodeURIComponent(id)}`, 'DELETE');
+      return await workerCall(`${base}/${encodeURIComponent(id)}`, 'DELETE', undefined, privileged);
     },
 
     async deleteMany(query) {
-      return await workerCall(`${base}/bulk`, 'DELETE', { query });
+      return await workerCall(`${base}/bulk`, 'DELETE', { query }, privileged);
     },
 
     async updateMany(query, update) {
-      return await workerCall(`${base}/bulk`, 'PATCH', { query, update });
+      return await workerCall(`${base}/bulk`, 'PATCH', { query, update }, privileged);
     },
 
     async bulkUpdate(records) {
-      return await workerCall(`${base}/bulk`, 'PATCH', { records });
+      return await workerCall(`${base}/bulk`, 'PATCH', { records }, privileged);
     },
 
     async schema() {

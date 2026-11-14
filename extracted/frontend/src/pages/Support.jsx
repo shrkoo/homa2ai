@@ -53,7 +53,8 @@ export default function Support() {
         toast({ title: t('ticket_sent') });
         setSubject(''); setMessage('');
         await load();
-        openTicket(data.ticket.id);
+        if (data.id) await openTicket(data.id);
+        else await load();
       }
     } catch { toast({ title: t('error_occurred') }); }
     setBusy(false);

@@ -33,6 +33,10 @@ export const supportAdapter = {
   async adminUpdateTicket(data) {
     return invokeFunctionDirect('adminUpdateTicket', data);
   },
+
+  async adminReplyTicket(data) {
+    return invokeFunctionDirect('adminReplyTicket', data);
+  },
 };
 
 export default supportAdapter;

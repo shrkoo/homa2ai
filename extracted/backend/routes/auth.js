@@ -8,7 +8,7 @@
  * Token format: homa_<userId>.<expiry>.<hmac>
  *
  * Routes:
- *   POST   /auth/register        — { email, password } → { otp_sent, dev_otp? }
+ *   POST   /auth/register        — { email, password } → { otp_sent }
  *   POST   /auth/verify-otp      — { email, otp_code } → { access_token, user }
  *   POST   /auth/login           — { email, password } → { access_token, user }
  *   POST   /auth/resend-otp      — { email } → { otp_sent }
@@ -32,7 +32,8 @@ import { successResponse, errorResponse, ErrorCodes } from '../lib/errors.js';
 
 // ===== Email helpers (Resend API — optional) =====
 async function sendOtpEmail(env, email, otpCode) {
-  if (!env.RESEND_API_KEY) return false;
+  if (!env.RESEND_API_KEY || !env.MAIL_FROM) return false;
+  const from = String(env.MAIL_FROM).trim();
   try {
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
@@ -41,7 +42,7 @@ async function sendOtpEmail(env, email, otpCode) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        from: 'Homa AI <noreply@resend.dev>',
+        from,
         to: email,
         subject: 'کد تأیید هُما',
         html: `<div style="font-family:Vazirmatn,sans-serif;direction:rtl;text-align:center;padding:32px"><h2>هُما</h2><p style="font-size:18px">کد تأیید شما:</p><p style="font-size:36px;font-weight:bold;letter-spacing:8px;color:#217 91% 60%">${otpCode}</p><p style="color:#666">این کد تا ۱۰ دقیقه معتبر است.</p></div>`,
@@ -54,7 +55,8 @@ async function sendOtpEmail(env, email, otpCode) {
 }
 
 async function sendResetEmail(env, email, resetToken) {
-  if (!env.RESEND_API_KEY) return false;
+  if (!env.RESEND_API_KEY || !env.MAIL_FROM) return false;
+  const from = String(env.MAIL_FROM).trim();
   try {
     const resetUrl = `${env.APP_BASE_URL || 'https://capable-aria-chat-flow.base44.app'}/reset-password?token=${resetToken}`;
     const res = await fetch('https://api.resend.com/emails', {
@@ -64,7 +66,7 @@ async function sendResetEmail(env, email, resetToken) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        from: 'Homa AI <noreply@resend.dev>',
+        from,
         to: email,
         subject: 'بازیابی رمز عبور هُما',
         html: `<div style="font-family:Vazirmatn,sans-serif;direction:rtl;text-align:center;padding:32px"><h2>هُما</h2><p>برای بازیابی رمز عبور روی لینک زیر کلیک کنید:</p><p><a href="${resetUrl}" style="display:inline-block;padding:12px 32px;background:#2389f5;color:#fff;border-radius:24px;text-decoration:none">بازیابی رمز عبور</a></p><p style="color:#666">این لینک تا ۱ ساعت معتبر است.</p></div>`,
@@ -131,30 +133,43 @@ export async function handleAuthRoutes(request, env, url) {
 
     if (!env.DB) return errorResponse(ErrorCodes.INTERNAL_ERROR, 500, 'Database not configured');
 
-    // Check if email already exists
+    // Existing D1 users without a password are legacy Base44 accounts.
+    // Keep their original ID so old conversations and records remain attached.
     const existing = await getUserByEmail(env, email);
-    if (existing) return errorResponse(ErrorCodes.INVALID_INPUT, 400, 'این ایمیل قبلاً ثبت شده');
+    if (existing?.password_hash) return errorResponse(ErrorCodes.INVALID_INPUT, 400, 'این ایمیل قبلاً ثبت شده است؛ وارد شوید یا رمز را بازیابی کنید');
 
-    // Create user
-    const userId = genUserId();
+    const userId = existing?.id || genUserId();
+    const previousPasswordHash = existing?.password_hash || '';
     const passwordHash = await hashPassword(password);
     const otpCode = generateOtp();
     const otpExpiry = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
     try {
-      await env.DB.prepare(
-        'INSERT INTO users (id, email, role, password_hash, otp_code, otp_expires_at) VALUES (?, ?, ?, ?, ?, ?)'
-      ).bind(userId, email, 'user', passwordHash, otpCode, otpExpiry).run();
+      if (existing) {
+        await env.DB.prepare('UPDATE users SET password_hash = ?, otp_code = ?, otp_expires_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+          .bind(passwordHash, otpCode, otpExpiry, userId).run();
+      } else {
+        await env.DB.prepare(
+          'INSERT INTO users (id, email, role, password_hash, otp_code, otp_expires_at) VALUES (?, ?, ?, ?, ?, ?)'
+        ).bind(userId, email, 'user', passwordHash, otpCode, otpExpiry).run();
+      }
     } catch (e) {
       return errorResponse(ErrorCodes.INTERNAL_ERROR, 500, e.message);
     }
 
-    // Send OTP via email (or return in response for dev)
     const emailSent = await sendOtpEmail(env, email, otpCode);
-    return successResponse({
-      otp_sent: true,
-      ...(emailSent ? {} : { dev_otp: otpCode, dev_note: 'Email not configured — OTP returned in response' }),
-    });
+    if (!emailSent) {
+      try {
+        if (existing) {
+          await env.DB.prepare('UPDATE users SET password_hash = ?, otp_code = ?, otp_expires_at = ? WHERE id = ?')
+            .bind(previousPasswordHash, '', '', userId).run();
+        } else {
+          await env.DB.prepare('DELETE FROM users WHERE id = ?').bind(userId).run();
+        }
+      } catch {}
+      return errorResponse('EMAIL_UNAVAILABLE', 503, 'ارسال کد تأیید ممکن نشد. تنظیمات ایمیل هُما باید بررسی شود.');
+    }
+    return successResponse({ otp_sent: true, legacy_account: !!existing });
   }
 
   // ----- POST /auth/verify-otp -----
@@ -176,11 +191,17 @@ export async function handleAuthRoutes(request, env, url) {
     if (!user.otp_code || user.otp_code !== otpCode) return errorResponse(ErrorCodes.INVALID_INPUT, 400, 'کد تأیید اشتباه');
     if (user.otp_expires_at && new Date(user.otp_expires_at) < new Date()) return errorResponse(ErrorCodes.INVALID_INPUT, 400, 'کد تأیید منقضی شده');
 
-    // Clear OTP, mark as verified
+    // Atomically consume the OTP so it cannot be replayed by concurrent requests.
     try {
-      await env.DB.prepare('UPDATE users SET otp_code = ?, otp_expires_at = ? WHERE id = ?')
-        .bind('', '', user.id).run();
-    } catch {}
+      const consumed = await env.DB.prepare(
+        'UPDATE users SET otp_code = ?, otp_expires_at = ? WHERE id = ? AND otp_code = ? AND otp_expires_at >= ?'
+      ).bind('', '', user.id, otpCode, new Date().toISOString()).run();
+      if (!consumed.meta || consumed.meta.changes !== 1) {
+        return errorResponse(ErrorCodes.INVALID_INPUT, 400, 'کد تأیید منقضی یا قبلاً استفاده شده است.');
+      }
+    } catch {
+      return errorResponse(ErrorCodes.INTERNAL_ERROR, 500, 'تأیید ایمیل انجام نشد. دوباره تلاش کنید.');
+    }
 
     const token = await issueHomaToken(user.id, env);
     return successResponse({ access_token: token, user: sanitizeUser(user) });
@@ -202,7 +223,8 @@ export async function handleAuthRoutes(request, env, url) {
     if (!env.DB) return errorResponse(ErrorCodes.INTERNAL_ERROR, 500, 'Database not configured');
     const user = await getUserByEmail(env, email);
     if (!user) return errorResponse(ErrorCodes.INVALID_INPUT, 401, 'ایمیل یا رمز عبور اشتباه');
-    if (!user.password_hash) return errorResponse(ErrorCodes.INVALID_INPUT, 400, 'لطفاً رمز عبور را بازیابی کنید (حساب Base44 قدیمی)');
+    if (user.otp_code) return errorResponse('EMAIL_NOT_VERIFIED', 403, 'ابتدا ایمیل خود را تأیید کنید؛ در صورت نیاز کد تازه بگیرید.');
+    if (!user.password_hash) return errorResponse(ErrorCodes.INVALID_INPUT, 400, 'این حساب قدیمی است؛ با همان ایمیل ثبت‌نام کنید تا حساب قبلی بازیابی شود.');
 
     const valid = await verifyPassword(password, user.password_hash);
     if (!valid) return errorResponse(ErrorCodes.INVALID_INPUT, 401, 'ایمیل یا رمز عبور اشتباه');
@@ -234,8 +256,17 @@ export async function handleAuthRoutes(request, env, url) {
         .bind(otpCode, otpExpiry, user.id).run();
     } catch {}
 
+    const previousOtp = user.otp_code || '';
+    const previousExpiry = user.otp_expires_at || '';
     const emailSent = await sendOtpEmail(env, email, otpCode);
-    return successResponse({ otp_sent: true, ...(emailSent ? {} : { dev_otp: otpCode }) });
+    if (!emailSent) {
+      try {
+        await env.DB.prepare('UPDATE users SET otp_code = ?, otp_expires_at = ? WHERE id = ? AND otp_code = ?')
+          .bind(previousOtp, previousExpiry, user.id, otpCode).run();
+      } catch {}
+      return errorResponse('EMAIL_UNAVAILABLE', 503, 'ارسال کد تأیید ممکن نشد. تنظیمات ایمیل هُما باید بررسی شود.');
+    }
+    return successResponse({ otp_sent: true });
   }
 
   // ----- GET /auth/me -----
@@ -309,7 +340,15 @@ export async function handleAuthRoutes(request, env, url) {
         .bind(resetToken, resetExpiry, user.id).run();
     } catch {}
 
-    await sendResetEmail(env, email, resetToken);
+    const emailSent = await sendResetEmail(env, email, resetToken);
+    if (!emailSent) {
+      try {
+        await env.DB.prepare('UPDATE users SET reset_token = ?, reset_expires_at = ? WHERE id = ? AND reset_token = ?')
+          .bind('', '', user.id, resetToken).run();
+      } catch {}
+      // Keep the same generic response to avoid revealing whether an email exists.
+      return successResponse({ sent: true });
+    }
     return successResponse({ sent: true });
   }
 

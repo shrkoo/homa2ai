@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { Check, Loader2, Sparkles } from 'lucide-react';
+import { Loader2, Sparkles } from 'lucide-react';
 import { useSearchParams } from 'react-router-dom';
-import { dataAdapter, billingAdapter } from '@/lib/adapters';
+import { billingAdapter } from '@/lib/adapters';
 import { useI18n } from '@/i18n/I18nContext';
 import PageHeader from '@/components/PageHeader';
 import { toast } from '@/components/ui/use-toast';
@@ -14,7 +14,7 @@ export default function Pricing() {
   const [loading, setLoading] = useState({});
 
   useEffect(() => {
-    dataAdapter.list('Plan','sort').then(setPlans).catch(() => {});
+    billingAdapter.listPlans().then(setPlans).catch(() => {});
     billingAdapter.refreshUsage().then((r) => setUsage(r?.data || r)).catch(() => {});
     const pay = searchParams.get('pay');
     if (pay === 'ok') toast({ title: t('payment_success') });
@@ -29,8 +29,8 @@ export default function Pricing() {
       const data = res?.data || res;
       if (data.error) {
         toast({ title: data.error === 'no_merchant' ? t('err_payment_config') : t('payment_failed') });
-      } else if (data.gatewayUrl) {
-        window.location.href = data.gatewayUrl;
+      } else if (data.gatewayUrl || data.redirect_url) {
+        window.location.href = data.gatewayUrl || data.redirect_url;
       }
     } catch (e) {
       toast({ title: t('payment_failed') });
@@ -38,8 +38,8 @@ export default function Pricing() {
     setLoading((p) => ({ ...p, [planId]: false }));
   };
 
-  const nameOf = (p) => (language === 'en' ? p.name_en : language === 'ku' ? p.name_ku : p.name_fa) || p.id;
-  const fmtPrice = (n) => n.toLocaleString('fa-IR');
+  const nameOf = (p) => (language === 'en' ? p.name_en : language === 'ku' ? p.name_ku : p.name_fa) || p.name || p.id;
+  const fmtPrice = (n) => Number(n || 0).toLocaleString('fa-IR');
 
   return (
     <div className="min-h-dvh">
@@ -57,19 +57,17 @@ export default function Pricing() {
               <div className="flex items-start justify-between gap-3">
                 <div>
                   <p className="font-heading font-bold text-lg">{nameOf(p)}</p>
-                  <p className="text-2xl font-bold mt-1">{p.price_toman === 0 ? t('plan_free') : fmtPrice(p.price_toman) + ' ' + t('toman')}</p>
-                  {p.price_toman > 0 && <p className="text-xs text-muted-foreground">{t('per_month')}</p>}
+                  {p.description && <p className="text-xs text-muted-foreground mt-1">{p.description}</p>}
+                  <p className="text-2xl font-bold mt-1">{Number(p.price ?? p.price_toman ?? 0) === 0 ? t('plan_free') : fmtPrice(p.price ?? p.price_toman) + ' ' + t('toman')}</p>
+                  {Number(p.price ?? p.price_toman ?? 0) > 0 && <p className="text-xs text-muted-foreground">{t('per_month')}</p>}
                 </div>
-                {p.price_toman > 0 && (
+                {Number(p.price ?? p.price_toman ?? 0) > 0 && (
                   <button onClick={() => buy(p.id)} disabled={loading[p.id]} className="inline-flex items-center gap-1.5 px-4 h-9 rounded-full bg-primary text-primary-foreground text-sm font-semibold disabled:opacity-50 shrink-0">
                     {loading[p.id] ? <Loader2 size={15} className="animate-spin" /> : <Sparkles size={15} />} {t('upgrade_now')}
                   </button>
                 )}
               </div>
-              <ul className="mt-3 grid grid-cols-2 gap-1.5">
-                <li className="text-xs text-muted-foreground flex items-start gap-1.5"><Check size={13} className="text-primary mt-0.5 shrink-0" /> {t('web_search')}: {p.web_search_per_day}/day</li>
-                {p.deep_research && <li className="text-xs text-muted-foreground flex items-start gap-1.5"><Check size={13} className="text-primary mt-0.5 shrink-0" /> {t('deep_research')}: {p.deep_research_per_day}/day</li>}
-              </ul>
+              <p className="mt-3 text-xs text-muted-foreground">{p.credits || 0} {t('credits_label')}</p>
             </div>
           ))}
         </div>
