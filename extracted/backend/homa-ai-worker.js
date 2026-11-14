@@ -20,7 +20,7 @@
  * KV:      USER_CONNECTIONS  (encrypted connector credentials, per-user)
  *          GOOGLE_TOKENS     (encrypted Google OAuth tokens)
  */
-import { getAdapter, getAdapterCapabilities, classify } from './providers/index.js';
+import { getAdapter, getAdapterCapabilities, classify, getAuthProviderMeta, getAllProviderStatuses } from './providers/index.js';
 import { ENTITY_MAP, isValidEntity } from './lib/db.js';
 import { handleApiRoutes } from './routes/api.js';
 import { handleAdminRoutes } from './routes/admin.js';
@@ -28,7 +28,154 @@ import { handleSupportRoutes } from './routes/support.js';
 import { handleReferralRoutes } from './routes/referral.js';
 import { handlePaymentRoutes } from './routes/payments.js';
 import { handleAuthRoutes } from './routes/auth.js';
-import { requireAuth, requireAdmin, requireUserAuth, issueHomaToken } from './lib/auth.js';
+import { handleStripeRoutes, handleStripeWebhook } from './routes/stripe.js';
+import { requireAuth, requireAdmin, requireUserAuth, issueHomaToken, ensureUserRecord } from './lib/auth.js';
+import { handleQuotaRoutes } from './quota/quotaRoutes.js';
+import { handleSyncRoutes } from './routes/sync.js';
+import { handleInternalCoffeeReading } from './routes/coffeeReading.js';
+import { handleInternalLifeCompass } from './routes/lifeCompass.js';
+import { handlePublicCoffeeReading, handlePublicLifeCompass, handlePublicDailyChallenge } from './routes/publicAi.js';
+import { handleIntelligenceRoutes, handleToolRoute } from './routes/intelligence.js';
+import { handleActionRoutes } from './routes/actionAgent.js';
+import { handleMemoryExtract, handleMemoryRetrieve, handleMemoryList, handleMemoryDelete, handleMemoryUpdate, handleMemoryClear, buildMemoryContext } from './routes/memory.js';
+import { handleNotificationRoutes } from './routes/notifications.js';
+import { reserveQuota, commitQuota, refundQuota, detectCapability } from './quota/quotaService.js';
+
+// ===== Auto-Migration (self-healing D1 schema) =====
+// Runs once per Worker isolate on the first request after deployment.
+// Checks if the users table has the 'role' column; if not, runs all
+// ALTER TABLE statements from migration_schema_fix.sql. Safe to re-run
+// (duplicate-column errors are caught and ignored). No data is lost.
+let _schemaReady = false;
+async function ensureSchema(env) {
+  if (_schemaReady) return;
+  if (!env.DB) { _schemaReady = true; return; }
+  try {
+    // Check and fix conversations table (missing columns from old schema)
+    try {
+      const convInfo = await env.DB.prepare('PRAGMA table_info(conversations)').all();
+      const convCols = (convInfo.results || []).map(c => c.name);
+      if (convCols.length > 0 && !convCols.includes('language')) {
+        const convMigrations = [
+          "ALTER TABLE conversations ADD COLUMN language TEXT DEFAULT 'fa'",
+          "ALTER TABLE conversations ADD COLUMN model TEXT DEFAULT 'auto'",
+          "ALTER TABLE conversations ADD COLUMN temporary INTEGER DEFAULT 0",
+          "ALTER TABLE conversations ADD COLUMN archived INTEGER DEFAULT 0",
+          "ALTER TABLE conversations ADD COLUMN folder_id TEXT DEFAULT ''",
+          "ALTER TABLE conversations ADD COLUMN last_message TEXT DEFAULT ''",
+          "ALTER TABLE conversations ADD COLUMN updated_at TEXT DEFAULT (datetime('now'))",
+        ];
+        for (const sql of convMigrations) {
+          try { await env.DB.prepare(sql).run(); } catch (e) { /* duplicate column — safe */ }
+        }
+      }
+    } catch (e) { /* table might not exist yet — safe */ }
+
+    const info = await env.DB.prepare('PRAGMA table_info(users)').all();
+    const cols = (info.results || []).map(c => c.name);
+    if (!cols.includes('full_name') || !cols.includes('onboarding_completed')) {
+      const migrations = [
+        "ALTER TABLE messages ADD COLUMN user_id TEXT DEFAULT ''",
+        "ALTER TABLE messages ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE usage ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE orders ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE api_keys ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE api_credits ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE api_usage ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE library_items ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE prompt_templates ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE favorites ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE favorite_stores ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE search_history ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE price_history ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE price_reminders ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE plans ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE feature_costs ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE credit_transactions ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE users ADD COLUMN password_hash TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN otp_code TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN otp_expires_at TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN reset_token TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN reset_expires_at TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN full_name TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user'",
+        "ALTER TABLE users ADD COLUMN memory TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN default_model TEXT DEFAULT 'auto'",
+        "ALTER TABLE users ADD COLUMN onboarding_completed INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN referral_source TEXT DEFAULT ''",
+        "ALTER TABLE referrals ADD COLUMN referred_credits_awarded INTEGER DEFAULT 0",
+        "ALTER TABLE referrals ADD COLUMN premium_days_awarded INTEGER DEFAULT 0",
+      ];
+      for (const sql of migrations) {
+        try { await env.DB.prepare(sql).run(); } catch (e) { /* duplicate column — safe */ }
+      }
+      try { await env.DB.prepare("UPDATE messages SET user_id = (SELECT user_id FROM conversations WHERE conversations.id = messages.conversation_id) WHERE user_id = ''").run(); } catch (e) {}
+      try { await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_msg_user ON messages(user_id, created_at DESC)').run(); } catch (e) {}
+      try { await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)').run(); } catch (e) {}
+      try { await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_users_reset_token ON users(reset_token)').run(); } catch (e) {}
+    }
+    // Quota system tables (capability-specific quotas with reserve/commit/refund)
+    try {
+      await env.DB.batch([
+        env.DB.prepare(`CREATE TABLE IF NOT EXISTS quota_buckets (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, capability TEXT NOT NULL, period_start TEXT NOT NULL, period_end TEXT NOT NULL, quota_limit INTEGER NOT NULL DEFAULT 0, reserved INTEGER NOT NULL DEFAULT 0, consumed INTEGER NOT NULL DEFAULT 0, reset_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'available', created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')))`),
+        env.DB.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS idx_qb_user_cap_period ON quota_buckets(user_id, capability, period_start)`),
+        env.DB.prepare(`CREATE TABLE IF NOT EXISTS quota_reservations (id TEXT PRIMARY KEY, reservation_id TEXT UNIQUE NOT NULL, user_id TEXT NOT NULL, request_id TEXT NOT NULL, bucket_id TEXT NOT NULL, capability TEXT NOT NULL, amount_reserved INTEGER NOT NULL DEFAULT 0, amount_committed INTEGER NOT NULL DEFAULT 0, amount_refunded INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'PENDING', expires_at TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')))`),
+        env.DB.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS idx_qr_res_id ON quota_reservations(reservation_id)`),
+        env.DB.prepare(`CREATE TABLE IF NOT EXISTS credit_ledger (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, bucket_id TEXT DEFAULT '', request_id TEXT DEFAULT '', reservation_id TEXT DEFAULT '', capability TEXT NOT NULL, type TEXT NOT NULL, amount INTEGER NOT NULL, balance_before INTEGER NOT NULL DEFAULT 0, balance_after INTEGER NOT NULL DEFAULT 0, reason TEXT DEFAULT '', metadata TEXT DEFAULT '', created_at TEXT DEFAULT (datetime('now')))`),
+        env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_cl_user ON credit_ledger(user_id, created_at DESC)`),
+        // 24-Hour Premium Pass — temporarily upgrades free users to Pro tier
+        env.DB.prepare(`CREATE TABLE IF NOT EXISTS premium_passes (id TEXT PRIMARY KEY, user_id TEXT NOT NULL UNIQUE, activated_at TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')))`),
+      ]);
+    } catch {}
+
+    // Subscription sync table (authoritative plan source from Base44)
+    try {
+      await env.DB.batch([
+        env.DB.prepare(
+          `CREATE TABLE IF NOT EXISTS subscription_sync (
+            base44_user_id TEXT PRIMARY KEY,
+            plan_key TEXT NOT NULL,
+            subscription_status TEXT NOT NULL DEFAULT 'active',
+            period_start TEXT DEFAULT '',
+            period_end TEXT DEFAULT '',
+            request_id TEXT UNIQUE,
+            synced_at TEXT DEFAULT (datetime('now'))
+          )`
+        ),
+        env.DB.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS idx_ss_request ON subscription_sync(request_id)`),
+      ]);
+    } catch {}
+    // Add base44_user_id column to users (for plan lookup mapping)
+    try {
+      await env.DB.prepare('ALTER TABLE users ADD COLUMN base44_user_id TEXT DEFAULT ""').run();
+    } catch {}
+
+    // User Memory table — persistent long-term memory per user
+    try {
+      await env.DB.batch([
+        env.DB.prepare(`CREATE TABLE IF NOT EXISTS user_memories (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          category TEXT NOT NULL DEFAULT 'fact',
+          memory_key TEXT NOT NULL DEFAULT '',
+          memory_value TEXT NOT NULL DEFAULT '',
+          source TEXT NOT NULL DEFAULT 'chat',
+          conversation_id TEXT DEFAULT '',
+          relevance_score REAL DEFAULT 0.5,
+          last_accessed TEXT DEFAULT '',
+          created_at TEXT DEFAULT (datetime('now')),
+          updated_at TEXT DEFAULT (datetime('now'))
+        )`),
+        env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_um_user ON user_memories(user_id, category, created_at DESC)`),
+        env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_um_user_cat ON user_memories(user_id, category)`),
+      ]);
+    } catch {}
+
+    _schemaReady = true;
+  } catch (e) {
+    _schemaReady = true; // don't block requests if check fails
+  }
+}
 
 const MODEL_ALLOWLIST = {
   auto:       { openrouterId: null },
@@ -40,16 +187,17 @@ const MODEL_ALLOWLIST = {
   ling:       { openrouterId: 'inclusionai/ling-3.0-flash-fin:free' }
 };
 
-const GROQ_MODELS = ['llama-3.3-70b-versatile', 'openai/gpt-oss-120b', 'llama-3.1-8b-instant'];
-const GROQ_VISION_MODELS = ['meta-llama/llama-4-scout-17b-16e-instruct', 'meta-llama/llama-4-maverick-17b-128e-instruct'];
-const OR_VISION_MODELS = ['minimax/minimax-m3:free', 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free'];
+const GROQ_MODELS = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'qwen/qwen3.8-27b'];
+const GROQ_VISION_MODELS = ['qwen/qwen3.8-27b'];
+const OR_VISION_MODELS = ['qwen/qwen3.8-27b:free', 'google/gemma-4-31b-it:free', 'google/gemma-4-26b-a4b-it:free', 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free', 'dots-studio/dots-3-note-preview:free'];
 const MAX_TOKENS = 8192;
 const TIMEOUT_MS = 20000;
 
 function pickAutoModel(messages) {
   const lastUser = [...messages].reverse().find(m => m.role === 'user');
   const text = (lastUser?.content || '').toLowerCase();
-  if (text.length > 800 || /تحقیق|پژوهش|تحلیل عمیق|گزارش جامع|معماری|پروژه|research|deep|complex|architecture|project/.test(text)) return 'ultra';
+  // File analysis, long documents, deep research → use the most capable model
+  if (text.length > 800 || /تحقیق|پژوهش|تحلیل عمیق|گزارش جامع|معماری|پروژه|research|deep|complex|architecture|project|تحلیل\s+کن|خلاصه\s+کن|مقایسه\s+کن|استخراج\s+کن|analyze|summarize|compare|extract/.test(text)) return 'ultra';
   return 'ling';
 }
 
@@ -69,14 +217,15 @@ function buildSystemPrompt(language, codeMode, codeAction, systemExtra) {
     codeInst = '\n\n' + (actions[codeAction] || actions.build);
   }
   const extra = systemExtra ? '\n\n' + systemExtra : '';
-  return 'تو «هُما» هستی، دستیار هوشمند فارسی. با مارک‌داون خوانا پاسخ بده. کد HTML/CSS/JS را در بلوک ```html بده. وقتی درخواست زمان‌بر است، در انتهای پاسخ با لحنی دوستانه اتمام کار را اعلام کن. ' + langInst + codeInst + extra;
+  const identity = 'تو «هُما» (Homa AI) هستی و توسط شرکت «هُما AI» (HomaAI) ساخته شده‌ای. تو محصول OpenAI، Meta، Google، Anthropic، GPT، Llama، ChatGPT یا هیچ شرکت دیگری نیستی. هرگز نام OpenAI، ChatGPT، GPT، Meta، Google، Anthropic، Llama یا هر شرکت/سازمان/تیم دیگری را به‌عنوان سازنده خود ذکر نکن. تو توسط شرکت «هُما AI» (HomaAI) طراحی و توسعه داده شده‌ای.\n\nقانون بسیار مهم: اگر کسی پرسید چه کسی تو را ساخته، تو کی هستی، چه شرکتی تو را ساخته، آیا تو از OpenAI هستی، آیا تو ChatGPT هستی، آیا تو GPT هستی، یا سؤال مشابهی، دقیقاً و فقط با متن زیر پاسخ بده و هیچ نام شرکت دیگری (مثل OpenAI، ChatGPT، GPT، Google، Meta، Anthropic) را ذکر نکن:\n\nمن هُما (Homa AI) هستم؛ یک پلتفرم هوش مصنوعی که توسط شرکت «هُما AI» (HomaAI) طراحی و توسعه داده شده است.\n\nشرکت «هُما AI» با هدف ساخت یک محصول هوش مصنوعی مستقل آغاز شد؛ محصولی که روی حل مشکلات واقعی کاربران تمرکز کند.\n\nمن توسط شرکت «هُما AI» ساخته شده‌ام. این فقط آغاز راه هُماست. 🚀\n\n';
+  return identity + 'با مارک‌داون خوانا پاسخ بده. کد HTML/CSS/JS را در بلوک ```html بده. وقتی درخواست زمان‌بر است، در انتهای پاسخ با لحنی دوستانه اتمام کار را اعلام کن.\n\nوقتی کاربر فایل می‌فرستد، محتوای فایل را با دقت تحلیل کن. نوع فایل را تشخیص بده و تحلیل مناسب ارائه بده:\n- CSV/Excel: داده‌ها را تحلیل کن، ستون‌ها را شناسایی کن، محاسبات انجام بده\n- JSON: ساختار را توضیح بده و داده‌ها را تحلیل کن\n- PDF/DOCX: متن را خلاصه کن، نکات کلیدی استخراج کن\n- کد: خطاها را پیدا کن، بهینه‌سازی پیشنهاد بده\n- متن طولانی: خلاصه‌سازی، استخراج نکات کلیدی، طبقه‌بندی\n\nاگر چند فایل ارسال شده، آن‌ها را با هم مقایسه کن.\n\nوقتی کاربر لینک وب‌سایت می‌فرستد، محتوای صفحه بازخوانی شده و در متن پیام قرار می‌گیرد. آن را تحلیل کن، خلاصه کن و به سوالات کاربر درباره محتوای لینک پاسخ بده.\n\nقانون جدول: فقط وقتی اطلاعات ذاتاً جدولی هستند (مقایسه چند گزینه، قیمت‌ها، برنامه زمانی، مشخصات فنی) از جدول مارک‌داون استفاده کن؛ در پاسخ‌های معمولی، گفتگوی ساده و توضیح‌های متنی هرگز جدول نساز. قانون ایموجی: ایموجی را کم و فقط جایی بگذار که واقعاً مناسب است (حداکثر یک یا دو مورد)؛ در بیشتر پاسخ‌ها، به‌ویژه پاسخ‌های فنی و جدی، ایموجی نگذار. ' + langInst + codeInst + extra;
 }
 
 function corsHeaders() {
   return {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'POST, GET, PATCH, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-User-Token'
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-User-Token, X-Base44-User-Id'
   };
 }
 
@@ -169,7 +318,7 @@ async function callOpenRouterVision(messages, env) {
       const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, messages, temperature: 0.7, max_tokens: 4096, reasoning: { enabled: false } }),
+        body: JSON.stringify({ model, messages, temperature: 0.4, max_tokens: 2048 }),
         signal: controller.signal
       });
       clearTimeout(timeout);
@@ -240,7 +389,7 @@ async function duckDuckGoSearch(query, maxResults) {
 async function groqCompleteSimple(system, userMsg, maxTokens, env) {
   const apiKey = env.GROQ_API_KEY;
   if (!apiKey) throw new Error('no_groq_key');
-  const models = ['openai/gpt-oss-120b', 'llama-3.3-70b-versatile', 'llama-3.1-8b-instant'];
+  const models = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'qwen/qwen3.8-27b'];
   const messages = [{ role: 'system', content: system }, { role: 'user', content: userMsg }];
   for (const mdl of models) {
     try {
@@ -367,6 +516,120 @@ async function handleDeepResearch(body, env) {
   return jsonBody({ content, sources: sources.map(s => ({ title: s.title, url: s.url, description: s.description, site: s.site })) });
 }
 
+// ===== HOMA TRUTH — Fact-checking Handler =====
+async function handleTruthCheck(body, env) {
+  const claim = (body.claim || '').trim();
+  const language = body.language || 'fa';
+  const imageData = Array.isArray(body.image_data) ? body.image_data.filter(b => typeof b === 'string' && (b.startsWith('data:image') || b.startsWith('http'))) : [];
+  const url = (body.url || '').trim();
+  const fileText = (body.file_text || '').trim();
+
+  if (!claim && !imageData.length && !url && !fileText) {
+    return jsonBody({ error: 'no_input' }, 400);
+  }
+
+  // Step 1: If URL provided, fetch page content (with SSRF protection)
+  let pageContent = '';
+  if (url) { try { pageContent = await fetchUrlContent(url); } catch {} }
+
+  // Step 2: If image provided, analyze with vision model
+  let imageAnalysis = '';
+  if (imageData.length > 0) {
+    try {
+      const visionMessages = [
+        { role: 'system', content: 'You are a fact-checking assistant. Analyze the image and extract: 1) Any visible text or claims, 2) What the image shows, 3) Any identifiable logos, watermarks, or signs of manipulation. Be factual. Do NOT claim it is AI-generated unless you see clear evidence. Respond in Persian.' },
+        { role: 'user', content: [
+          { type: 'text', text: 'Analyze this image for fact-checking purposes.' },
+          ...imageData.slice(0, 5).map(img => ({ type: 'image_url', image_url: { url: img } }))
+        ] }
+      ];
+      let result = await callGroqVision(visionMessages, env);
+      if (result.error) result = await callOpenRouterVision(visionMessages, env);
+      if (!result.error) imageAnalysis = result.content || '';
+    } catch {}
+  }
+
+  // Step 3: Build search query
+  const searchQuery = claim || (imageAnalysis ? imageAnalysis.slice(0, 200) : '') || (pageContent ? pageContent.slice(0, 200) : '') || url;
+
+  if (!searchQuery) {
+    return jsonBody({
+      verdict: 'insufficient_evidence', confidence: null,
+      summary: 'متنی برای بررسی پیدا نشد.', key_findings: [], contradictions: [],
+      sources: [], checked_at: new Date().toISOString(),
+    });
+  }
+
+  // Step 4: Web search for evidence (supporting + opposing)
+  let sources = [];
+  try { sources = await duckDuckGoSearch(searchQuery, 8); } catch {}
+  let opposingSources = [];
+  try { opposingSources = await duckDuckGoSearch(searchQuery + ' debunk false fake دروغ جعلی رد', 4); } catch {}
+  const allSources = [...sources, ...opposingSources];
+  const seen = {}; const dedupedSources = [];
+  for (const s of allSources) { if (s.url && !seen[s.url]) { seen[s.url] = 1; dedupedSources.push(s); } }
+
+  // Step 5: LLM analysis with truth-verification prompt
+  const context = dedupedSources.map((s, i) => `[${i + 1}] ${s.title} (${s.site}): ${s.description}\nURL: ${s.url}`).join('\n');
+
+  const system = `You are Homa Truth, a fact-checking assistant. Your job is to verify claims using real evidence from web search results.
+
+CRITICAL RULES:
+- Use ONLY the provided sources. Do NOT fabricate sources, URLs, quotes, or confidence percentages.
+- If there is not enough evidence, return verdict "insufficient_evidence". Never guess.
+- Confidence: provide a number 0-100 ONLY if you can justify it from the sources. Otherwise null.
+- Rank sources: official/government/primary sources rank higher than blogs/social media.
+- If sources contradict each other, report the contradiction in the "contradictions" array.
+
+Return ONLY a JSON object:
+{
+  "verdict": "confirmed" | "needs_review" | "likely_false" | "insufficient_evidence",
+  "confidence": number 0-100 or null,
+  "summary": "brief explanation in the user's language",
+  "key_findings": ["finding 1", "finding 2"],
+  "contradictions": [{"source_a": "what source A says", "source_b": "what source B says", "description": "the disagreement"}]
+}
+
+Verdict meanings:
+- confirmed: multiple reliable sources support the claim
+- needs_review: some evidence exists but not enough for full confirmation
+- likely_false: reliable sources contradict the claim
+- insufficient_evidence: not enough sources to make any judgment
+
+${langInstruction(language)}`;
+
+  const userMsg = `Claim to verify: "${searchQuery}"
+${pageContent ? '\nPage content from URL:\n' + pageContent.slice(0, 3000) : ''}
+${imageAnalysis ? '\nImage analysis:\n' + imageAnalysis : ''}
+${fileText ? '\nFile content:\n' + fileText.slice(0, 3000) : ''}
+
+Web search sources:
+${context || '(no sources found)'}`;
+
+  let analysisResult = null;
+  try {
+    const raw = await groqCompleteSimple(system, userMsg, 2048, env);
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (jsonMatch) analysisResult = JSON.parse(jsonMatch[0]);
+  } catch {}
+
+  if (!analysisResult) {
+    return jsonBody({
+      verdict: 'insufficient_evidence', confidence: null,
+      summary: 'شواهد کافی برای تأیید قطعی پیدا نشد.',
+      key_findings: [], contradictions: [],
+      sources: dedupedSources.map(s => ({ title: s.title, url: s.url, site: s.site, description: s.description })),
+      checked_at: new Date().toISOString(),
+    });
+  }
+
+  return jsonBody({
+    ...analysisResult,
+    sources: dedupedSources.map(s => ({ title: s.title, url: s.url, site: s.site, description: s.description })),
+    checked_at: new Date().toISOString(),
+  });
+}
+
 // ===== TTS Handler (Piper) =====
 function bytesToBase64(bytes) {
   let binary = '';
@@ -482,12 +745,92 @@ async function handleUploadFile(body, env) {
   return jsonBody({ error: 'upload_failed' }, 502);
 }
 
+// ===== SSRF Protection =====
+function isPrivateIp(hostname) {
+  const h = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  // IPv6 loopback/link-local
+  if (h === '::1' || h === '::' || h === '0:0:0:0:0:0:0:1' || h.startsWith('fe80:') || h.startsWith('fc') || h.startsWith('fd')) return true;
+  // IPv4 checks
+  const parts = h.split('.');
+  if (parts.length === 4 && parts.every(p => /^\d+$/.test(p))) {
+    const [a, b] = parts.map(Number);
+    if (a === 10) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 127) return true;
+    if (a === 169 && b === 254) return true; // metadata endpoints
+    if (a === 0) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+  }
+  return false;
+}
+
+function validateFetchUrl(urlStr) {
+  let parsed;
+  try { parsed = new URL(urlStr); } catch { return null; }
+  if (!['http:', 'https:'].includes(parsed.protocol)) return null;
+  if (isPrivateIp(parsed.hostname)) return null;
+  if (parsed.username || parsed.password) return null; // block credentials in URL
+  return parsed;
+}
+
+// ===== Fetch URL content (for in-chat web link analysis) =====
+async function fetchUrlContent(url) {
+  const validated = validateFetchUrl(url);
+  if (!validated) return '';
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    const res = await fetch(validated.href, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; HomaAI/1.0)' },
+      signal: controller.signal,
+      redirect: 'follow',
+    });
+    clearTimeout(timeout);
+    // Re-validate the final URL after redirects (prevent SSRF via redirect)
+    const finalUrl = validateFetchUrl(res.url || validated.href);
+    if (!finalUrl) return '';
+    if (!res.ok) return '';
+    const ct = res.headers.get('content-type') || '';
+    const raw = await res.text();
+    if (ct.includes('text/html') || (raw.length > 0 && raw.trimStart().startsWith('<'))) {
+      return raw
+        .replace(/<script[\s\S]*?<\/script>/gi, '')
+        .replace(/<style[\s\S]*?<\/style>/gi, '')
+        .replace(/<nav[\s\S]*?<\/nav>/gi, '')
+        .replace(/<footer[\s\S]*?<\/footer>/gi, '')
+        .replace(/<header[\s\S]*?<\/header>/gi, '')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+        .replace(/\s+/g, ' ').trim().slice(0, 8000);
+    }
+    if (ct.includes('text/') || ct.includes('json') || ct.includes('xml')) return raw.slice(0, 8000);
+    return '';
+  } catch { return ''; }
+}
+
 // ===== File Analysis Handler (text/document) =====
 async function handleFileAnalyze(body, env) {
-  const text = body.text || '';
-  const question = body.question || '';
+  let text = body.text || '';
+  const question = body.question || body.prompt || '';
+  const fileUrl = body.file_url || '';
   const language = body.language || 'fa';
-  if (!text.trim()) return jsonBody({ error: 'empty text' }, 400);
+  // If no text but a file_url is provided, try to fetch the content
+  if (!text.trim() && fileUrl) {
+    try {
+      const res = await fetch(fileUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; HomaAI/1.0)' } });
+      if (res.ok) {
+        const ct = res.headers.get('content-type') || '';
+        if (ct.includes('text/') || ct.includes('json') || ct.includes('xml') || ct.includes('markdown')) {
+          text = await res.text();
+          if (ct.includes('html') || (text.length > 0 && text.trimStart().startsWith('<'))) {
+            text = text.replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim();
+          }
+        }
+      }
+    } catch {}
+  }
+  if (!text.trim()) return jsonBody({ error: 'empty text', message: 'File content could not be read. Provide text or a valid text file URL.' }, 400);
   const system = 'You are Homa, a file analyst. Analyze the file content and answer the question about it. Use well-formatted Markdown. Be concise and accurate. ' + langInstruction(language);
   try {
     const content = await groqCompleteSimple(system, `File content:\n${text.slice(0, 8000)}\n\nQuestion: ${question || 'خلاصه و تحلیل این فایل را ارائه بده.'}`, 2048, env);
@@ -849,12 +1192,25 @@ async function handleCreateJob(body, env, userKey) {
     return jsonBody({ error: 'capability_not_supported', code: 'not_supported', status: 'NOT_SUPPORTED' }, 400);
   }
 
-  // Decrypt the user's stored credential for this provider
-  const conn = await getConnection(userKey, toolId, env);
-  if (!conn) return jsonBody({ error: 'not_connected', code: 'not_connected' }, 401);
+  // Resolve credentials based on the provider's auth type
+  const authMeta = getAuthProviderMeta(toolId);
   let apiKey;
-  try { apiKey = await decryptKey(conn.encrypted_key, env); }
-  catch { return jsonBody({ error: 'decryption_failed', code: 'not_configured' }, 500); }
+
+  if (authMeta.auth_type === 'not_available') {
+    return jsonBody({ error: 'provider_not_available', code: 'not_available', status: 'NOT_AVAILABLE' }, 503);
+  }
+
+  if (authMeta.auth_type === 'server_configured') {
+    // Homa holds the key server-side — no user connection needed
+    apiKey = env[authMeta.secret_env_var];
+    if (!apiKey) return jsonBody({ error: 'server_key_not_configured', code: 'not_configured' }, 500);
+  } else {
+    // User-supplied API key — decrypt from KV
+    const conn = await getConnection(userKey, toolId, env);
+    if (!conn) return jsonBody({ error: 'not_connected', code: 'not_connected' }, 401);
+    try { apiKey = await decryptKey(conn.encrypted_key, env); }
+    catch { return jsonBody({ error: 'decryption_failed', code: 'not_configured' }, 500); }
+  }
 
   const jobId = genJobId();
   const now = new Date().toISOString();
@@ -906,29 +1262,35 @@ async function handleGetJob(jobId, env, userKey) {
   if (job.status === 'PROCESSING' && job.provider_id) {
     const adapter = getAdapter(job.provider_id);
     if (adapter && adapter.isAsync && adapter.isAsync() && job.provider_job_id) {
-      const conn = await getConnection(userKey, job.provider_id, env);
-      if (conn) {
-        let apiKey;
-        try { apiKey = await decryptKey(conn.encrypted_key, env); } catch { apiKey = null; }
-        if (apiKey) {
-          try {
-            const polled = await adapter.getJobStatus({ provider_job_id: job.provider_job_id, apiKey, env, context: job.context });
-            if (polled.status === 'COMPLETED') {
-              const done = { ...job, status: 'COMPLETED', result_url: polled.result_url, result_text: polled.result_text, context: polled.metadata, completed_at: new Date().toISOString() };
-              await storeJob(userKey, jobId, done, env);
-              return jsonBody(sanitizeJob(done));
-            }
-            if (polled.status === 'FAILED') {
-              const fail = { ...job, status: 'FAILED', error: polled.error, code: polled.code };
-              await storeJob(userKey, jobId, fail, env);
-              return jsonBody(sanitizeJob(fail));
-            }
-            // Still processing — update context/timestamp
-            await storeJob(userKey, jobId, { ...job, context: polled.context || job.context }, env);
-            return jsonBody(sanitizeJob({ ...job, context: polled.context || job.context }));
-          } catch (e) {
-            return jsonBody(sanitizeJob({ ...job, error: e.message }));
+      // Resolve credentials based on auth type (same logic as handleCreateJob)
+      const pollAuthMeta = getAuthProviderMeta(job.provider_id);
+      let pollApiKey = null;
+      if (pollAuthMeta.auth_type === 'server_configured') {
+        pollApiKey = env[pollAuthMeta.secret_env_var] || null;
+      } else if (pollAuthMeta.auth_type !== 'not_available') {
+        const conn = await getConnection(userKey, job.provider_id, env);
+        if (conn) {
+          try { pollApiKey = await decryptKey(conn.encrypted_key, env); } catch { pollApiKey = null; }
+        }
+      }
+      if (pollApiKey) {
+        try {
+          const polled = await adapter.getJobStatus({ provider_job_id: job.provider_job_id, apiKey: pollApiKey, env, context: job.context });
+          if (polled.status === 'COMPLETED') {
+            const done = { ...job, status: 'COMPLETED', result_url: polled.result_url, result_text: polled.result_text, context: polled.metadata, completed_at: new Date().toISOString() };
+            await storeJob(userKey, jobId, done, env);
+            return jsonBody(sanitizeJob(done));
           }
+          if (polled.status === 'FAILED') {
+            const fail = { ...job, status: 'FAILED', error: polled.error, code: polled.code };
+            await storeJob(userKey, jobId, fail, env);
+            return jsonBody(sanitizeJob(fail));
+          }
+          // Still processing — update context/timestamp
+          await storeJob(userKey, jobId, { ...job, context: polled.context || job.context }, env);
+          return jsonBody(sanitizeJob({ ...job, context: polled.context || job.context }));
+        } catch (e) {
+          return jsonBody(sanitizeJob({ ...job, error: e.message }));
         }
       }
     }
@@ -954,25 +1316,6 @@ async function handleCancelJob(jobId, env, userKey) {
 function sanitizeJob(job) {
   const { ...rest } = job;
   return rest;
-}
-
-// ===== Tool Router (intent classification) =====
-async function handleToolRoute(body, env) {
-  const message = (body.message || '').trim();
-  if (!message) return jsonBody({ error: 'message required' }, 400);
-  const language = body.language || 'fa';
-  const system = `You are Homa's Tool Router. Analyze the user's message and determine what capability is needed.
-Return ONLY a JSON object:
-{"capability":"CAPABILITY_ID or null","confidence":0.0-1.0,"needs_attachment":true/false,"summary":"brief description"}
-Capability IDs: TEXT_GENERATION, REASONING, CODE_GENERATION, CODE_DEBUGGING, WEB_SEARCH, DEEP_RESEARCH, WEBSITE_ANALYSIS, IMAGE_GENERATION, IMAGE_ANALYSIS, IMAGE_EDITING, IMAGE_UPSCALING, BACKGROUND_REMOVAL, VIDEO_GENERATION, IMAGE_TO_VIDEO, VIDEO_ANALYSIS, VIDEO_EDITING, TEXT_TO_SPEECH, SPEECH_TO_TEXT, VOICE_CLONING, MUSIC_GENERATION, FILE_ANALYSIS, GLOBAL_SEARCH, INSTAGRAM_ANALYSIS, TIKTOK_ANALYSIS, FACEBOOK_ANALYSIS
-If the message is general conversation that doesn't need a specific tool, return capability: null.
-${langInstruction(language)}`;
-  try {
-    const raw = await groqCompleteSimple(system, message, 256, env);
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    if (jsonMatch) return jsonBody(JSON.parse(jsonMatch[0]));
-    return jsonBody({ capability: null, confidence: 0, summary: '' });
-  } catch { return jsonBody({ capability: null, confidence: 0, summary: '' }); }
 }
 
 // GET /connection/status?tool_id=... (query-param variant)
@@ -1035,6 +1378,23 @@ async function handleDisconnectTool(body, env, userKey) {
 async function handleConnectionStatus(body, env, userKey) {
   const toolId = (body.tool_id || '').trim();
   if (!toolId) return jsonBody({ error: 'tool_id required' }, 400);
+
+  // Check auth type first — server_configured and not_available don't use KV
+  const authMeta = getAuthProviderMeta(toolId);
+  if (authMeta.auth_type === 'not_available') {
+    return jsonBody({ status: 'NOT_AVAILABLE', provider_id: toolId, auth_type: 'not_available' });
+  }
+  if (authMeta.auth_type === 'server_configured') {
+    const hasKey = !!env[authMeta.secret_env_var];
+    return jsonBody({
+      status: hasKey ? 'CONNECTED' : 'SETUP_REQUIRED',
+      provider_id: toolId,
+      auth_type: 'server_configured',
+      secret_env_var: authMeta.secret_env_var,
+      verified: hasKey,
+    });
+  }
+
   if (!env.USER_CONNECTIONS) return jsonBody({ status: 'NOT_CONFIGURED', provider_id: toolId });
   if (!env.HOMA_ENCRYPTION_KEY) return jsonBody({ status: 'NOT_CONFIGURED', provider_id: toolId });
 
@@ -1198,13 +1558,26 @@ async function handleGoogleCallback(request, env) {
       const email = (profile.email || '').trim().toLowerCase();
       if (!email) return new Response('No email in Google profile', { status: 400 });
 
-      // Find or create user
+      // Find or create user — preserve existing account, link OAuth to same email
       let user = await env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email).first();
       if (!user) {
         const newUserId = 'usr_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
-        await env.DB.prepare('INSERT INTO users (id, email, role, password_hash) VALUES (?, ?, ?, ?)')
-          .bind(newUserId, email, 'user', '').run();
-        user = { id: newUserId, email };
+        const fullName = profile.name || profile.given_name || '';
+        try {
+          await env.DB.prepare('INSERT INTO users (id, email, role, password_hash, full_name) VALUES (?, ?, ?, ?, ?)')
+            .bind(newUserId, email, 'user', '', fullName).run();
+        } catch (e) {
+          // Fallback if full_name column doesn't exist yet (pre-migration)
+          await env.DB.prepare('INSERT INTO users (id, email, role, password_hash) VALUES (?, ?, ?, ?)')
+            .bind(newUserId, email, 'user', '').run();
+        }
+        user = { id: newUserId, email, full_name: fullName };
+      } else if (!user.full_name && (profile.name || profile.given_name)) {
+        // Link OAuth: update full_name if existing user has none
+        try {
+          await env.DB.prepare('UPDATE users SET full_name = ? WHERE id = ?')
+            .bind(profile.name || profile.given_name || '', user.id).run();
+        } catch {}
       }
 
       // Issue Homa token
@@ -1478,7 +1851,9 @@ async function runSmartWatchChecks(env) {
 
 // Whitelist of sortable columns (prevent SQL injection via ORDER BY)
 const SORTABLE_COLUMNS = new Set([
-  'created_at', 'updated_at', 'title', 'status', 'priority', 'amount', 'credits', 'balance',
+  'created_at', 'updated_at', 'created_date', 'updated_date',
+  'title', 'status', 'priority', 'amount', 'credits', 'balance',
+  'name', 'sort', 'active', 'price_toman', 'remind_at', 'triggered_at', 'next_trigger', 'due_date',
 ]);
 
 function safeSort(field) {
@@ -1766,27 +2141,42 @@ async function handleD1CRUD(request, env, url, userKey, entityName) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: corsHeaders() });
     }
 
     const url = new URL(request.url);
 
+    // Auto-migrate D1 schema on first request after deployment (self-healing)
+    await ensureSchema(env);
+
+    // Public email/password auth must run before the generic user-token guard.
+    if (url.pathname === '/auth' || url.pathname.startsWith('/auth/')) {
+      return await handleAuthRoutes(request, env, url);
+    }
+
+    if (url.pathname === '/internal/coffee-reading' && request.method === 'POST') return await handleInternalCoffeeReading(request, env);
+    if (url.pathname === '/internal/life-compass' && request.method === 'POST') return await handleInternalLifeCompass(request, env);
+    if (url.pathname.startsWith('/internal/')) return await handleSyncRoutes(request, env, url);
+    if (url.pathname.startsWith('/ai/') && request.method === 'POST') { const a = await requireUserAuth(request, env); if (a.error) return a.error; if (url.pathname === '/ai/coffee-reading') return await handlePublicCoffeeReading(request, env); if (url.pathname === '/ai/life-compass') return await handlePublicLifeCompass(request, env); if (url.pathname === '/ai/daily-challenge') return await handlePublicDailyChallenge(request, env); }
+
     // ===== New modular routes (B7-B11) =====
     // ZarinPal callback is a GET redirect from the gateway — no auth header.
     if (url.pathname === '/payments/zarinpal/callback') {
       return await handlePaymentRoutes(request, env, url, { id: '' });
     }
-    // Auth routes (independent email/password — no Base44 dependency)
-    if (url.pathname.startsWith('/auth/')) {
-      return await handleAuthRoutes(request, env, url);
+    // Stripe webhook — no auth (signature-verified by Stripe)
+    if (url.pathname === '/stripe/webhook' && request.method === 'POST') {
+      return await handleStripeWebhook(request, env);
     }
     if (url.pathname.startsWith('/api/')) {
-      const auth = await requireAuth(request, env);
+      const auth = await requireUserAuth(request, env);
       if (auth.error) return auth.error;
       return await handleApiRoutes(request, env, url, auth.user);
     }
+    if (url.pathname.startsWith('/intelligence/')) { const a = await requireUserAuth(request, env); if (a.error) return a.error; return await handleIntelligenceRoutes(request, env, url); }
+    if (url.pathname.startsWith('/action/')) { const a = await requireUserAuth(request, env); if (a.error) return a.error; return await handleActionRoutes(request, env, url); }
     if (url.pathname.startsWith('/admin/')) {
       return await handleAdminRoutes(request, env, url);
     }
@@ -1805,12 +2195,32 @@ export default {
       if (auth.error) return auth.error;
       return await handlePaymentRoutes(request, env, url, auth.user);
     }
+    if (url.pathname.startsWith('/stripe/')) {
+      const auth = await requireUserAuth(request, env);
+      if (auth.error) return auth.error;
+      return await handleStripeRoutes(request, env, url, auth.user);
+    }
 
     // GET routes — Google OAuth flow (browser redirects, no auth header needed)
     if (request.method === 'GET') {
       if (url.pathname === '/google/auth') return await handleGoogleAuth(request, env);
       if (url.pathname === '/google/callback') return await handleGoogleCallback(request, env);
       if (url.pathname === '/connection/status') return await handleConnectionStatusGet(request, env, url);
+      if (url.pathname === '/tools/status') return jsonBody({ providers: getAllProviderStatuses(env) });
+
+      // GET /v1/quota — capability quotas
+      if (url.pathname === '/v1/quota') {
+        const userToken = request.headers.get('X-User-Token') || '';
+        if (!userToken) return jsonBody({ error: 'user_identity_required', code: 'no_user_token' }, 401);
+        let qKey;
+        try { qKey = await deriveUserKey(userToken, env); } catch { return jsonBody({ error: 'user_identity_required', code: 'no_user_token' }, 401); }
+        // Store base44_user_id mapping for plan lookup
+        const b44Id = request.headers.get('X-Base44-User-Id') || '';
+        if (b44Id) {
+          try { await env.DB.prepare('UPDATE users SET base44_user_id = ? WHERE id = ? AND (base44_user_id IS NULL OR base44_user_id = "" OR base44_user_id = ?)').bind(b44Id, qKey, b44Id).run(); } catch {}
+        }
+        return await handleQuotaRoutes(request, env, url, qKey);
+      }
 
       // D1 data routes — /data/{entity} and /data/{entity}/{id}
       const dataMatch = url.pathname.match(/^\/data\/([a-z_]+)(\/[^/]+)?$/);
@@ -1819,6 +2229,11 @@ export default {
         if (!userToken) return jsonBody({ error: 'user_identity_required', code: 'no_user_token' }, 401);
         let userKey;
         try { userKey = await deriveUserKey(userToken, env); } catch { return jsonBody({ error: 'user_identity_required', code: 'no_user_token' }, 401); }
+        // Store base44_user_id mapping for plan lookup
+        const b44Id = request.headers.get('X-Base44-User-Id') || '';
+        if (b44Id) {
+          try { await env.DB.prepare('UPDATE users SET base44_user_id = ? WHERE id = ? AND (base44_user_id IS NULL OR base44_user_id = "" OR base44_user_id = ?)').bind(b44Id, userKey, b44Id).run(); } catch {}
+        }
         return await handleD1CRUD(request, env, url, userKey, dataMatch[1]);
       }
       // GET /jobs/{id} — job status (requires auth + user identity)
@@ -1830,6 +2245,18 @@ export default {
         try { userKey = await deriveUserKey(userToken, env); } catch { return jsonBody({ error: 'user_identity_required', code: 'no_user_token' }, 401); }
         return await handleGetJob(decodeURIComponent(jobGetMatch[1]), env, userKey);
       }
+      // GET /memory/retrieve — retrieve memories for chat context
+      if (url.pathname === '/memory/retrieve') {
+        const userToken = request.headers.get('X-User-Token') || '';
+        if (!userToken) return jsonBody({ error: 'user_identity_required', code: 'no_user_token' }, 401);
+        let userKey;
+        try { userKey = await deriveUserKey(userToken, env); } catch { return jsonBody({ error: 'user_identity_required', code: 'no_user_token' }, 401); }
+        return jsonBody(await handleMemoryRetrieve(request, env, url, userKey));
+      }
+      // /notifications/* — FCM push notification token registration & sending
+      if (url.pathname.startsWith('/notifications/')) { const ut = request.headers.get('X-User-Token') || ''; if (!ut) return jsonBody({ error: 'user_identity_required' }, 401); try { const k = await deriveUserKey(ut, env); await ensureUserRecord(env, k); return await handleNotificationRoutes(request, env, url, k, ut); } catch { return jsonBody({ error: 'user_identity_required' }, 401); } }
+      // GET /memory/list — list all memories (management UI)
+      if (url.pathname === '/memory/list') { const ut = request.headers.get('X-User-Token') || ''; if (!ut) return jsonBody({ error: 'user_identity_required' }, 401); try { const k = await deriveUserKey(ut, env); return jsonBody(await handleMemoryList(request, env, url, k)); } catch { return jsonBody({ error: 'user_identity_required' }, 401); } }
       // GET /alarms, /reminders, /alarms/history, /alarms/:id, /reminders/:id
       if (/^\/(alarms|reminders)(\/[^/]+){0,2}$/.test(url.pathname)) {
         const userToken = request.headers.get('X-User-Token') || '';
@@ -1855,6 +2282,28 @@ export default {
     try { userKey = await deriveUserKey(userToken, env); }
     catch { return jsonBody({ error: 'user_identity_required', code: 'no_user_token' }, 401); }
 
+    // Ensure user record exists in D1 (prevents FK constraint errors on data inserts)
+    try { await ensureUserRecord(env, userKey); } catch (e) { /* non-blocking */ }
+
+    // Store base44_user_id mapping (for subscription plan lookup)
+    // Only set if not already set to a different value — prevents hijacking.
+    const base44UserId = request.headers.get('X-Base44-User-Id') || '';
+    if (base44UserId) {
+      try {
+        await env.DB.prepare(
+          'UPDATE users SET base44_user_id = ? WHERE id = ? AND (base44_user_id IS NULL OR base44_user_id = "" OR base44_user_id = ?)'
+        ).bind(base44UserId, userKey, base44UserId).run();
+      } catch {}
+    }
+
+    // POST /v1/quota/* — reserve, commit, refund
+    if (url.pathname.startsWith('/v1/quota/')) {
+      return await handleQuotaRoutes(request, env, url, userKey);
+    }
+
+    const isDataRoute = url.pathname.startsWith('/data/');
+    const isAlarmRoute = /^\/(alarms|reminders)/.test(url.pathname);
+
     try {
       // D1 data CRUD (POST/PATCH/DELETE)
       if (isDataRoute) {
@@ -1862,6 +2311,11 @@ export default {
         if (entityMatch && isValidEntity(entityMatch[1])) {
           return await handleD1CRUD(request, env, url, userKey, entityMatch[1]);
         }
+      }
+
+      // Phone push registration (POST /notifications/register, /notifications/send)
+      if (url.pathname.startsWith('/notifications/')) {
+        return await handleNotificationRoutes(request, env, url, userKey, userToken);
       }
 
       // Alarm / Reminder / History CRUD (POST/PATCH/DELETE)
@@ -1888,6 +2342,23 @@ export default {
       if (url.pathname === '/jobs' && request.method === 'POST') {
         const body = await request.json();
         return await handleCreateJob(body, env, userKey);
+      }
+      // Memory routes
+      if (url.pathname === '/memory/extract' && request.method === 'POST') {
+        const body = await request.json();
+        return jsonBody(await handleMemoryExtract(body, env, userKey));
+      }
+      if (url.pathname === '/memory' && request.method === 'DELETE') {
+        return jsonBody(await handleMemoryClear(request, env, userKey));
+      }
+      const memUpdateMatch = url.pathname.match(/^\/memory\/([^/]+)$/);
+      if (memUpdateMatch) {
+        const memId = decodeURIComponent(memUpdateMatch[1]);
+        if (request.method === 'DELETE') return jsonBody(await handleMemoryDelete(request, env, url, userKey));
+        if (request.method === 'PATCH') {
+          const body = await request.json();
+          return jsonBody(await handleMemoryUpdate(body, env, url, userKey));
+        }
       }
       // /jobs/{id} (GET) and /jobs/{id}/cancel (POST)
       const jobMatch = url.pathname.match(/^\/jobs\/([^/]+)(\/cancel)?$/);
@@ -1916,6 +2387,7 @@ export default {
       if (type === 'video_generate') return await handleVideoGenerate(body, env);
       if (type === 'stt') return await handleSTT(body, env);
       if (type === 'global_search') return await handleGlobalSearch(body, env, request);
+      if (type === 'truth_check') return await handleTruthCheck(body, env);
       if (type === 'tool_route') return await handleToolRoute(body, env);
 
       // Default: chat
@@ -1927,15 +2399,30 @@ export default {
       const codeMode = !!body.codeMode;
       const codeAction = body.codeAction || '';
       const systemExtra = body.system_extra || '';
-      const imageData = Array.isArray(body.image_data) ? body.image_data.filter(b => typeof b === 'string' && b.startsWith('data:image')) : [];
+      const imageData = Array.isArray(body.image_data) ? body.image_data.filter(b => typeof b === 'string' && (b.startsWith('data:image') || b.startsWith('http'))) : [];
 
       if (!MODEL_ALLOWLIST[requestedModel]) return jsonBody({ error: 'invalid_model' });
 
       const system = buildSystemPrompt(language, codeMode, codeAction, systemExtra);
 
+      // ===== Retrieve user memories and inject into system prompt =====
+      let memoryContext = '';
+      try {
+        const lastUserMsg = messages[messages.length - 1]?.content || '';
+        memoryContext = await buildMemoryContext(env, userKey, lastUserMsg);
+      } catch {}
+
+      // ===== Quota: Reserve before execution =====
+      const _cap = detectCapability({ type: 'chat', image_data: imageData });
+      const _reqId = body.request_id || ('req_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
+      const _reserved = await reserveQuota(env, userKey, _cap, _reqId, 1);
+      if (!_reserved.ok) {
+        return jsonBody({ ok: false, error: { code: _reserved.code, capability: _reserved.capability, remaining: _reserved.remaining, reset_at: _reserved.reset_at, next_grant: _reserved.next_grant, upgrade_available: _reserved.upgrade_available } }, 402);
+      }
+
       // Vision path
       if (imageData.length > 0) {
-        const visionMessages = [{ role: 'system', content: system + '\n\nشما تصاویر واقعی دریافت کرده‌اید. محتوای بصری هر تصویر را مستقیماً تحلیل کن — اشیا، رنگ‌ها، متن داخل تصویر و جزئیات بصری را توصیف کن. هرگز به نام فایل تکیه نکن.' }];
+        const visionMessages = [{ role: 'system', content: system + memoryContext + '\n\nشما تصاویر واقعی دریافت کرده‌اید. یک تحلیلگر تصویر حرفه‌ای هستید. برای هر تصویر:\n\n۱. محتوای کلی تصویر را توصیف کن (چه چیزی در تصویر است)\n۲. اشیا، افراد، متن‌ها، رنگ‌ها و جزئیات بصری را شناسایی کن\n۳. اگر نمودار یا جدول در تصویر است، داده‌های آن را استخراج و تحلیل کن\n۴. اگر اسکرین‌شات است، محتوا و خطاهای احتمالی را بررسی کن\n۵. اگر کد یا خطای برنامه‌نویسی در تصویر است، آن را تحلیل کن\n۶. به سؤال کاربر درباره تصویر به‌طور تخصصی پاسخ بده\n\nهرگز به نام فایل تکیه نکن — فقط محتوای بصری واقعی را تحلیل کن. پاسخ را با مارک‌داون خوانا ارائه بده.' }];
         for (const m of messages) {
           if (m.role === 'user' && m === messages[messages.length - 1]) {
             const content = [{ type: 'text', text: m.content || '' }];
@@ -1947,11 +2434,29 @@ export default {
         }
         let result = await callGroqVision(visionMessages, env);
         if (result.error) result = await callOpenRouterVision(visionMessages, env);
+        if (result.error) {
+          // Vision failed — return error so the frontend falls back to Base44's vision path
+          await refundQuota(env, userKey, _reserved.reservation_id, 'PROVIDER_ERROR');
+          return jsonBody({ error: 'provider_failed' });
+        }
+        if (result.content) await commitQuota(env, userKey, _reserved.reservation_id, 1);
+        else await refundQuota(env, userKey, _reserved.reservation_id, 'PROVIDER_ERROR');
         return jsonBody(result);
       }
 
       // Text path
-      const apiMessages = [{ role: 'system', content: system }, ...messages];
+      const apiMessages = [{ role: 'system', content: system + memoryContext }, ...messages];
+
+      // Detect URLs in the last user message and fetch their content for in-chat analysis
+      const lastUsr = messages[messages.length - 1];
+      if (lastUsr && lastUsr.role === 'user' && !imageData.length) {
+        const urls = (lastUsr.content || '').match(/https?:\/\/[^\s<>"')]+/g) || [];
+        for (const u of urls.slice(0, 3)) {
+          const pageContent = await fetchUrlContent(u);
+          if (pageContent) apiMessages[apiMessages.length - 1].content += '\n\n[محتوای لینک ' + u + ']:\n' + pageContent;
+        }
+      }
+
       let result;
 
       if (requestedModel === 'auto') {
@@ -1968,8 +2473,19 @@ export default {
         }
       }
 
+      if (result.content) {
+        await commitQuota(env, userKey, _reserved.reservation_id, 1);
+        // Non-blocking memory extraction — store important facts from this conversation.
+        // Uses ctx.waitUntil so the extraction completes after the response is returned.
+        try {
+          const extractMessages = [...messages, { role: 'assistant', content: result.content }];
+          const extractPromise = handleMemoryExtract({ messages: extractMessages, conversation_id: body.conversation_id || '', language }, env, userKey);
+          ctx.waitUntil(extractPromise.catch(() => {}));
+        } catch {}
+      } else await refundQuota(env, userKey, _reserved.reservation_id, 'PROVIDER_ERROR');
       return jsonBody(result);
     } catch (error) {
+      if (_reserved?.ok) await refundQuota(env, userKey, _reserved.reservation_id, 'INTERNAL_ERROR');
       return jsonBody({ error: error.message || 'internal_error' });
     }
   },
