@@ -131,30 +131,43 @@ export async function handleAuthRoutes(request, env, url) {
 
     if (!env.DB) return errorResponse(ErrorCodes.INTERNAL_ERROR, 500, 'Database not configured');
 
-    // Check if email already exists
+    // Existing D1 users without a password are legacy Base44 accounts.
+    // Keep their original ID so old conversations and records remain attached.
     const existing = await getUserByEmail(env, email);
-    if (existing) return errorResponse(ErrorCodes.INVALID_INPUT, 400, 'این ایمیل قبلاً ثبت شده');
+    if (existing?.password_hash) return errorResponse(ErrorCodes.INVALID_INPUT, 400, 'این ایمیل قبلاً ثبت شده است؛ وارد شوید یا رمز را بازیابی کنید');
 
-    // Create user
-    const userId = genUserId();
+    const userId = existing?.id || genUserId();
+    const previousPasswordHash = existing?.password_hash || '';
     const passwordHash = await hashPassword(password);
     const otpCode = generateOtp();
     const otpExpiry = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
     try {
-      await env.DB.prepare(
-        'INSERT INTO users (id, email, role, password_hash, otp_code, otp_expires_at) VALUES (?, ?, ?, ?, ?, ?)'
-      ).bind(userId, email, 'user', passwordHash, otpCode, otpExpiry).run();
+      if (existing) {
+        await env.DB.prepare('UPDATE users SET password_hash = ?, otp_code = ?, otp_expires_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+          .bind(passwordHash, otpCode, otpExpiry, userId).run();
+      } else {
+        await env.DB.prepare(
+          'INSERT INTO users (id, email, role, password_hash, otp_code, otp_expires_at) VALUES (?, ?, ?, ?, ?, ?)'
+        ).bind(userId, email, 'user', passwordHash, otpCode, otpExpiry).run();
+      }
     } catch (e) {
       return errorResponse(ErrorCodes.INTERNAL_ERROR, 500, e.message);
     }
 
-    // Send OTP via email (or return in response for dev)
     const emailSent = await sendOtpEmail(env, email, otpCode);
-    return successResponse({
-      otp_sent: true,
-      ...(emailSent ? {} : { dev_otp: otpCode, dev_note: 'Email not configured — OTP returned in response' }),
-    });
+    if (!emailSent) {
+      try {
+        if (existing) {
+          await env.DB.prepare('UPDATE users SET password_hash = ?, otp_code = ?, otp_expires_at = ? WHERE id = ?')
+            .bind(previousPasswordHash, '', '', userId).run();
+        } else {
+          await env.DB.prepare('DELETE FROM users WHERE id = ?').bind(userId).run();
+        }
+      } catch {}
+      return errorResponse('EMAIL_UNAVAILABLE', 503, 'ارسال کد تأیید ممکن نشد. تنظیمات ایمیل هُما باید بررسی شود.');
+    }
+    return successResponse({ otp_sent: true, legacy_account: !!existing });
   }
 
   // ----- POST /auth/verify-otp -----
@@ -202,7 +215,8 @@ export async function handleAuthRoutes(request, env, url) {
     if (!env.DB) return errorResponse(ErrorCodes.INTERNAL_ERROR, 500, 'Database not configured');
     const user = await getUserByEmail(env, email);
     if (!user) return errorResponse(ErrorCodes.INVALID_INPUT, 401, 'ایمیل یا رمز عبور اشتباه');
-    if (!user.password_hash) return errorResponse(ErrorCodes.INVALID_INPUT, 400, 'لطفاً رمز عبور را بازیابی کنید (حساب Base44 قدیمی)');
+    if (user.otp_code) return errorResponse('EMAIL_NOT_VERIFIED', 403, 'ابتدا ایمیل خود را تأیید کنید؛ در صورت نیاز کد تازه بگیرید.');
+    if (!user.password_hash) return errorResponse(ErrorCodes.INVALID_INPUT, 400, 'این حساب قدیمی است؛ با همان ایمیل ثبت‌نام کنید تا حساب قبلی بازیابی شود.');
 
     const valid = await verifyPassword(password, user.password_hash);
     if (!valid) return errorResponse(ErrorCodes.INVALID_INPUT, 401, 'ایمیل یا رمز عبور اشتباه');
@@ -235,7 +249,8 @@ export async function handleAuthRoutes(request, env, url) {
     } catch {}
 
     const emailSent = await sendOtpEmail(env, email, otpCode);
-    return successResponse({ otp_sent: true, ...(emailSent ? {} : { dev_otp: otpCode }) });
+    if (!emailSent) return errorResponse('EMAIL_UNAVAILABLE', 503, 'ارسال کد تأیید ممکن نشد. تنظیمات ایمیل هُما باید بررسی شود.');
+    return successResponse({ otp_sent: true });
   }
 
   // ----- GET /auth/me -----
