@@ -8,7 +8,7 @@
  * Token format: homa_<userId>.<expiry>.<hmac>
  *
  * Routes:
- *   POST   /auth/register        — { email, password } → { otp_sent, dev_otp? }
+ *   POST   /auth/register        — { email, password } → { otp_sent }
  *   POST   /auth/verify-otp      — { email, otp_code } → { access_token, user }
  *   POST   /auth/login           — { email, password } → { access_token, user }
  *   POST   /auth/resend-otp      — { email } → { otp_sent }
