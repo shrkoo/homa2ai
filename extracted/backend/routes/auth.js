@@ -32,8 +32,8 @@ import { successResponse, errorResponse, ErrorCodes } from '../lib/errors.js';
 
 // ===== Email helpers (Resend API — optional) =====
 async function sendOtpEmail(env, email, otpCode) {
-  if (!env.RESEND_API_KEY) return false;
-  const from = env.MAIL_FROM || 'Homa AI <noreply@resend.dev>';
+  if (!env.RESEND_API_KEY || !env.MAIL_FROM) return false;
+  const from = String(env.MAIL_FROM).trim();
   try {
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
@@ -55,8 +55,8 @@ async function sendOtpEmail(env, email, otpCode) {
 }
 
 async function sendResetEmail(env, email, resetToken) {
-  if (!env.RESEND_API_KEY) return false;
-  const from = env.MAIL_FROM || 'Homa AI <noreply@resend.dev>';
+  if (!env.RESEND_API_KEY || !env.MAIL_FROM) return false;
+  const from = String(env.MAIL_FROM).trim();
   try {
     const resetUrl = `${env.APP_BASE_URL || 'https://capable-aria-chat-flow.base44.app'}/reset-password?token=${resetToken}`;
     const res = await fetch('https://api.resend.com/emails', {
@@ -66,7 +66,7 @@ async function sendResetEmail(env, email, resetToken) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        from: 'Homa AI <noreply@resend.dev>',
+        from,
         to: email,
         subject: 'بازیابی رمز عبور هُما',
         html: `<div style="font-family:Vazirmatn,sans-serif;direction:rtl;text-align:center;padding:32px"><h2>هُما</h2><p>برای بازیابی رمز عبور روی لینک زیر کلیک کنید:</p><p><a href="${resetUrl}" style="display:inline-block;padding:12px 32px;background:#2389f5;color:#fff;border-radius:24px;text-decoration:none">بازیابی رمز عبور</a></p><p style="color:#666">این لینک تا ۱ ساعت معتبر است.</p></div>`,
@@ -191,11 +191,17 @@ export async function handleAuthRoutes(request, env, url) {
     if (!user.otp_code || user.otp_code !== otpCode) return errorResponse(ErrorCodes.INVALID_INPUT, 400, 'کد تأیید اشتباه');
     if (user.otp_expires_at && new Date(user.otp_expires_at) < new Date()) return errorResponse(ErrorCodes.INVALID_INPUT, 400, 'کد تأیید منقضی شده');
 
-    // Clear OTP, mark as verified
+    // Atomically consume the OTP so it cannot be replayed by concurrent requests.
     try {
-      await env.DB.prepare('UPDATE users SET otp_code = ?, otp_expires_at = ? WHERE id = ?')
-        .bind('', '', user.id).run();
-    } catch {}
+      const consumed = await env.DB.prepare(
+        'UPDATE users SET otp_code = ?, otp_expires_at = ? WHERE id = ? AND otp_code = ? AND otp_expires_at >= ?'
+      ).bind('', '', user.id, otpCode, new Date().toISOString()).run();
+      if (!consumed.meta || consumed.meta.changes !== 1) {
+        return errorResponse(ErrorCodes.INVALID_INPUT, 400, 'کد تأیید منقضی یا قبلاً استفاده شده است.');
+      }
+    } catch {
+      return errorResponse(ErrorCodes.INTERNAL_ERROR, 500, 'تأیید ایمیل انجام نشد. دوباره تلاش کنید.');
+    }
 
     const token = await issueHomaToken(user.id, env);
     return successResponse({ access_token: token, user: sanitizeUser(user) });
@@ -250,8 +256,16 @@ export async function handleAuthRoutes(request, env, url) {
         .bind(otpCode, otpExpiry, user.id).run();
     } catch {}
 
+    const previousOtp = user.otp_code || '';
+    const previousExpiry = user.otp_expires_at || '';
     const emailSent = await sendOtpEmail(env, email, otpCode);
-    if (!emailSent) return errorResponse('EMAIL_UNAVAILABLE', 503, 'ارسال کد تأیید ممکن نشد. تنظیمات ایمیل هُما باید بررسی شود.');
+    if (!emailSent) {
+      try {
+        await env.DB.prepare('UPDATE users SET otp_code = ?, otp_expires_at = ? WHERE id = ? AND otp_code = ?')
+          .bind(previousOtp, previousExpiry, user.id, otpCode).run();
+      } catch {}
+      return errorResponse('EMAIL_UNAVAILABLE', 503, 'ارسال کد تأیید ممکن نشد. تنظیمات ایمیل هُما باید بررسی شود.');
+    }
     return successResponse({ otp_sent: true });
   }
 
@@ -326,7 +340,15 @@ export async function handleAuthRoutes(request, env, url) {
         .bind(resetToken, resetExpiry, user.id).run();
     } catch {}
 
-    await sendResetEmail(env, email, resetToken);
+    const emailSent = await sendResetEmail(env, email, resetToken);
+    if (!emailSent) {
+      try {
+        await env.DB.prepare('UPDATE users SET reset_token = ?, reset_expires_at = ? WHERE id = ? AND reset_token = ?')
+          .bind('', '', user.id, resetToken).run();
+      } catch {}
+      // Keep the same generic response to avoid revealing whether an email exists.
+      return successResponse({ sent: true });
+    }
     return successResponse({ sent: true });
   }
 
